@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cached, getToken, setToken, setUnauthorizedHandler, type Me } from "./api";
 import Auth from "./Auth";
-import Friends, { initials as initialsOf } from "./Friends";
+import { initials as initialsOf } from "./Friends";
 import Groups from "./Groups";
+import Budget from "./Budget";
+import Social from "./Social";
+import Learn from "./Learn";
+import Settings from "./Settings";
+import { timeAgo as feedTimeAgo, useWeek } from "./week";
 import Transactions, { statementPath } from "./Transactions";
 import AccountsPage, { LinkBankForm } from "./LinkBank";
 import { SignInLoading } from "./Loading";
@@ -62,6 +67,9 @@ type IconName =
   | "trend"
   | "users"
   | "flag"
+  | "piggy"
+  | "book"
+  | "logout"
   | "wallet";
 
 const iconPaths: Record<IconName, React.ReactNode> = {
@@ -177,6 +185,24 @@ const iconPaths: Record<IconName, React.ReactNode> = {
     <>
       <path d="M5 21V4" />
       <path d="M5 4h11l-2 4 2 4H5" />
+    </>
+  ),
+  book: (
+    <>
+      <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5v-15Z" />
+      <path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20v3H6.5A2.5 2.5 0 0 1 4 20.5ZM8 7h8M8 10.5h5" />
+    </>
+  ),
+  logout: (
+    <>
+      <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3" />
+      <path d="M10 16l-4-4 4-4M6 12h10" />
+    </>
+  ),
+  piggy: (
+    <>
+      <path d="M19 10.5c.8.3 1.5 1 1.5 2v1.5H19a6.5 6.5 0 0 1-2.5 3.2V20h-2.5v-1.6a8 8 0 0 1-3 0V20H8.5v-2.8A6.3 6.3 0 0 1 5 11.5C5 8 8.1 5.5 12 5.5c2.4 0 4.5.9 5.8 2.4" />
+      <path d="M16 3.5v3M7.5 11h.01" />
     </>
   ),
 };
@@ -319,6 +345,11 @@ function App() {
 function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; onMeChanged: () => void }) {
   const [period, setPeriod] = useState("this_month");
   const [activeNav, setActiveNav] = useState("Overview");
+  // Older links and notifications still say "Friends": that's the Social tab now.
+  const go = useCallback((nav: string) => {
+    setActiveNav(nav === "Friends" ? "Social" : nav);
+    window.scrollTo({ top: 0 });
+  }, []);
   const activeNavRef = useRef(activeNav);
   activeNavRef.current = activeNav;
   const [ai, setAi] = useState<InsightsResponse | null>(null);
@@ -431,18 +462,10 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
         </div>
         <div className="flex items-center gap-2 sm:gap-4">
           <AiStatusBadge />
-          <NotificationBell onOpenTarget={setActiveNav} />
+          <PointsPill onOpen={() => go("Budget")} />
+          <NotificationBell onOpenTarget={go} />
           <div className="mx-1 hidden h-7 w-px bg-[#DADDF1] sm:block" />
-          <div className="flex items-center gap-2 rounded-full p-1 pr-2">
-            <span className="grid size-9 place-items-center rounded-full bg-[#FFF0E2] text-sm font-bold text-[#FF8A5B]">{initials}</span>
-            <span className="hidden leading-tight sm:block">
-              <span className="block text-sm font-semibold text-[#FF8A5B]">{me.display_name}</span>
-              <span className="block text-[11px] text-[#8790AE]">@{me.username}</span>
-            </span>
-          </div>
-          <button className="rounded-lg border border-[#DADDF1] px-3 py-2 text-[11px] font-bold text-[#275992] transition hover:bg-[#E2E5F4]" onClick={onLogout}>
-            Log out
-          </button>
+          <UserMenu initials={initials} me={me} onGoTo={go} onLogout={onLogout} />
         </div>
       </header>
 
@@ -450,16 +473,18 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
         <aside className="fixed bottom-0 left-0 right-0 z-20 flex h-16 items-center justify-around border-t border-[#DADDF1] bg-[#FFFDF7] px-2 lg:sticky lg:top-[72px] lg:h-[calc(100vh-72px)] lg:w-[232px] lg:flex-col lg:items-stretch lg:justify-between lg:border-r lg:border-t-0 lg:p-4">
           <nav className="flex w-full justify-around lg:flex-col lg:gap-1" aria-label="Main navigation">
             {[
-              ["Overview", "grid"],
-              ["Insights", "insights"],
-              ["Friends", "users"],
-              ["Groups", "flag"],
-              ["Accounts", "wallet"],
-            ].map(([label, icon]) => (
+              ["Overview", "Home", "home"],
+              ["Insights", "Insights", "insights"],
+              ["Budget", "Budget", "piggy"],
+              ["Social", "Social", "users"],
+              ["Groups", "Groups", "flag"],
+              ["Learn", "Learn", "book"],
+            ].map(([key, label, icon]) => (
               <button
-                className={`nav-item ${activeNav === label ? "nav-item-active" : ""}`}
-                key={label}
-                onClick={() => setActiveNav(label)}
+                aria-current={activeNav === key ? "page" : undefined}
+                className={`nav-item ${activeNav === key ? "nav-item-active" : ""}`}
+                key={key}
+                onClick={() => go(key)}
               >
                 <Icon name={icon as IconName} size={19} />
                 <span>{label}</span>
@@ -467,26 +492,25 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
             ))}
           </nav>
           <div className="hidden lg:block">
-            <div className="mb-4 rounded-2xl bg-[#E2E5F4] p-4">
-              <div className="mb-3 grid size-8 place-items-center rounded-lg bg-white text-[#FF8A5B] shadow-sm">
-                <Icon name="help" size={17} />
-              </div>
-              <p className="text-xs font-bold">Need a hand?</p>
-              <p className="mt-1 text-[11px] leading-4 text-[#6F789A]">Our support team is here around the clock.</p>
-              <button className="mt-3 text-[11px] font-bold text-[#FF8A5B]">Get support →</button>
-            </div>
-            <button className="nav-item w-full">
+            <SidebarWeek onOpen={go} />
+            <button className={`nav-item w-full ${activeNav === "Settings" ? "nav-item-active" : ""}`} onClick={() => go("Settings")}>
               <Icon name="settings" size={19} />
-              Settings
+              <span>Settings</span>
             </button>
           </div>
         </aside>
 
         <main className="w-full min-w-0 px-5 pb-24 pt-7 sm:px-7 lg:px-10 lg:pb-10 lg:pt-10">
-          {activeNav === "Friends" ? (
-            <Friends myUsername={me.username} />
+          {activeNav === "Social" ? (
+            <Social me={me} onGoTo={go} />
+          ) : activeNav === "Learn" ? (
+            <Learn />
+          ) : activeNav === "Settings" ? (
+            <Settings me={me} onGoTo={go} onLogout={onLogout} />
           ) : activeNav === "Groups" ? (
             <Groups meId={me.id} />
+          ) : activeNav === "Budget" ? (
+            <Budget onGoTo={go} />
           ) : activeNav === "Accounts" ? (
             <AccountsPage linked={linked} onChange={onMeChanged} />
           ) : !linked ? (
@@ -529,6 +553,8 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
             </div>
             {periodPicker}
           </div>
+
+          <YourWeek onGoTo={go} />
 
           {error && (
             <div className="mb-5 rounded-xl border border-[#f3c9bd] bg-[#fff4f0] px-4 py-3 text-xs font-semibold text-[#9a3b22]" role="alert">
@@ -698,6 +724,8 @@ const timeAgo = (iso: string) => {
 };
 
 const notificationIcon: Record<string, IconName> = {
+  cheer: "users",
+  reaction: "users",
   friend_request: "users",
   friend_accepted: "users",
   group_invite: "flag",
@@ -728,7 +756,7 @@ function NotificationBell({ onOpenTarget }: { onOpenTarget: (target: string) => 
     return () => clearInterval(timer);
   }, [load]);
   // Friend requests, invites and group activity appear in the bell within ~2 s.
-  useLive(["friends", "groups"], load);
+  useLive(["friends", "groups", "budget"], load);
 
   // Close when clicking outside the panel.
   useEffect(() => {
@@ -857,6 +885,166 @@ function AiInsightsPanel({ ai, loading, onRefresh }: { ai: InsightsResponse | nu
 function Root() {
   const proof = new URLSearchParams(window.location.search).get("proof");
   return proof ? <ProofPage token={proof} /> : <App />;
+}
+
+// ---------- Your week: header points, sidebar card, Home summary (social.py /api/me/week) ----------
+
+function PointsPill({ onOpen }: { onOpen: () => void }) {
+  const week = useWeek();
+  if (!week) return null;
+  return (
+    <button
+      className="hidden items-center gap-1.5 rounded-full border border-[#DADDF1] bg-white px-3 py-1.5 text-xs font-bold text-[#275992] transition hover:bg-[#F4F5FB] sm:flex"
+      onClick={onOpen}
+      title="Your points this week"
+      type="button"
+    >
+      ⭐ {week.points}
+      <span className="font-semibold text-[#8790AE]">pts</span>
+      {week.streak >= 2 && <span className="text-[#d85f36]">🔥{week.streak}</span>}
+    </button>
+  );
+}
+
+function UserMenu({ me, initials, onGoTo, onLogout }: { me: Me; initials: string; onGoTo: (nav: string) => void; onLogout: () => void }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  const week = useWeek();
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => box.current && !box.current.contains(e.target as Node) && setOpen(false);
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [open]);
+  const pick = (nav: string) => {
+    setOpen(false);
+    onGoTo(nav);
+  };
+  const item = "flex w-full items-center gap-2.5 px-4 py-2.5 text-left text-xs font-semibold text-[#275992] transition hover:bg-[#F4F5FB]";
+  return (
+    <div className="relative" ref={box}>
+      <button aria-expanded={open} aria-label="Your account menu" className="flex items-center gap-2 rounded-full p-1 pr-2 transition hover:bg-[#F4F5FB]" onClick={() => setOpen((o) => !o)} type="button">
+        <span className="grid size-9 place-items-center rounded-full bg-[#FFF0E2] text-sm font-bold text-[#FF8A5B]">{initials}</span>
+        <span className="hidden text-left leading-tight sm:block">
+          <span className="block text-sm font-semibold text-[#FF8A5B]">{me.display_name}</span>
+          <span className="block text-[11px] text-[#8790AE]">@{me.username}</span>
+        </span>
+        <span className="hidden rotate-90 text-[#8790AE] sm:block">
+          <Icon name="chevron" size={14} />
+        </span>
+      </button>
+      {open && (
+        <div className="absolute right-0 top-12 z-40 w-60 overflow-hidden rounded-2xl border border-[#DADDF1] bg-[#FFFDF7] shadow-xl">
+          <div className="border-b border-[#DADDF1] px-4 py-3">
+            <p className="text-sm font-bold">{me.display_name}</p>
+            <p className="text-[11px] text-[#8790AE]">@{me.username}</p>
+            {week && (
+              <p className="mt-1.5 text-[11px] font-bold text-[#275992]">
+                ⭐ {week.points} pts this week{week.streak >= 2 ? ` · 🔥 ${week.streak}-week streak` : ""}
+              </p>
+            )}
+          </div>
+          <button className={item} onClick={() => pick("Accounts")} type="button">
+            <Icon name="wallet" size={16} /> Bank accounts
+          </button>
+          <button className={item} onClick={() => pick("Settings")} type="button">
+            <Icon name="settings" size={16} /> Settings & privacy
+          </button>
+          <button className={`${item} border-t border-[#DADDF1] !text-[#b4502f]`} onClick={onLogout} type="button">
+            <Icon name="logout" size={16} /> Log out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SidebarWeek({ onOpen }: { onOpen: (nav: string) => void }) {
+  const week = useWeek();
+  if (!week) return null;
+  return (
+    <button className="mb-3 block w-full rounded-2xl bg-[#E2E5F4] p-4 text-left transition hover:bg-[#D8DCF0]" onClick={() => onOpen("Budget")} type="button">
+      <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#6F789A]">This week</p>
+      <p className="mt-1 text-xl font-bold">⭐ {week.points} pts</p>
+      <p className="text-[11px] text-[#6F789A]">
+        {week.streak >= 2 ? `🔥 ${week.streak}-week streak · ` : ""}
+        {week.days_left === 0 ? "ends tonight" : `${week.days_left} day${week.days_left === 1 ? "" : "s"} left`}
+      </p>
+      {week.budget && (
+        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">
+          <div
+            className="h-full rounded-full"
+            style={{ width: `${Math.min(100, week.budget.used_pct ?? 0)}%`, background: (week.budget.used_pct ?? 0) > 100 ? "#ff8a5b" : (week.budget.used_pct ?? 0) >= 90 ? "#ffcc57" : "#2ec7a6" }}
+          />
+        </div>
+      )}
+    </button>
+  );
+}
+
+function YourWeek({ onGoTo }: { onGoTo: (nav: string) => void }) {
+  const week = useWeek();
+  if (!week) return <div className="mb-5 h-[108px] animate-pulse rounded-[18px] bg-white/60" />;
+  const card = "rounded-2xl border border-[#DADDF1] bg-[#FFFDF7] p-4 text-left transition hover:-translate-y-0.5 hover:shadow-md";
+  const label = "text-[10px] font-bold uppercase tracking-[0.1em] text-[#6F789A]";
+  const b = week.budget;
+  const n = week.next_payment;
+  const u = week.latest_update;
+  return (
+    <section aria-label="Your week" className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <button className={card} onClick={() => onGoTo("Budget")} type="button">
+        <p className={label}>Points this week</p>
+        <p className="mt-1 text-xl font-bold">⭐ {week.points}</p>
+        <p className="text-[10px] text-[#8790AE]">{week.streak >= 2 ? `🔥 ${week.streak}-week streak` : `${week.total_points} all-time`}</p>
+      </button>
+      <button className={card} onClick={() => onGoTo("Budget")} type="button">
+        <p className={label}>Budget left</p>
+        {b ? (
+          <>
+            <p className={`mt-1 text-xl font-bold ${b.left < 0 ? "text-[#b4502f]" : ""}`}>{b.left < 0 ? `-${money(-b.left)}` : money(b.left)}</p>
+            <p className="text-[10px] text-[#8790AE]">
+              {b.used_pct ?? 0}% used · {week.days_left === 0 ? "last day" : `${week.days_left} days left`}
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="mt-1 text-sm font-bold">No budget yet</p>
+            <p className="text-[10px] font-bold text-[#FF8A5B]">Set one up →</p>
+          </>
+        )}
+      </button>
+      <button className={card} onClick={() => onGoTo("Groups")} type="button">
+        <p className={label}>{n?.due ? "Next goal payment" : "Your goal"}</p>
+        {n ? (
+          <>
+            <p className="mt-1 truncate text-sm font-bold">{n.due && n.amount ? `${money(n.amount)} by ${shortDate(n.due)}` : `${n.my_pct}% of your share`}</p>
+            <p className="truncate text-[10px] text-[#8790AE]">{n.title}</p>
+          </>
+        ) : (
+          <>
+            <p className="mt-1 text-sm font-bold">No goals yet</p>
+            <p className="text-[10px] font-bold text-[#FF8A5B]">Save with friends →</p>
+          </>
+        )}
+      </button>
+      <button className={card} onClick={() => onGoTo("Social")} type="button">
+        <p className={label}>From your friends</p>
+        {u ? (
+          <>
+            <p className="mt-1 line-clamp-2 text-[11px] font-semibold leading-4">
+              {u.emoji} {u.text}
+            </p>
+            <p className="text-[10px] text-[#8790AE]">{feedTimeAgo(u.created_at)}</p>
+          </>
+        ) : (
+          <>
+            <p className="mt-1 text-sm font-bold">It's quiet</p>
+            <p className="text-[10px] font-bold text-[#FF8A5B]">Add friends →</p>
+          </>
+        )}
+      </button>
+    </section>
+  );
 }
 
 export default Root;

@@ -48,7 +48,7 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="px-5 py-6 text-xs text-[#8790AE] sm:px-6">{children}</p>;
 }
 
-export default function Friends({ myUsername }: { myUsername: string }) {
+export default function Friends({ myUsername, embedded = false }: { myUsername: string; embedded?: boolean }) {
   const [data, setData] = useState<Overview | null>(null);
   const [username, setUsername] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -118,11 +118,13 @@ export default function Friends({ myUsername }: { myUsername: string }) {
 
   return (
     <div>
-      <div className="mb-7">
-        <p className="mb-1 text-[11px] font-bold uppercase tracking-[0.14em] text-[#6F789A]">Friends</p>
-        <h1 className="text-[28px] font-bold tracking-[-0.045em] sm:text-[34px]">Your people</h1>
-        <p className="mt-1 text-sm text-[#6F789A]">Add friends now so you can save toward shared goals together.</p>
-      </div>
+      {!embedded && (
+        <div className="mb-7">
+          <p className="mb-1 text-[11px] font-bold uppercase tracking-[0.14em] text-[#6F789A]">Friends</p>
+          <h1 className="text-[28px] font-bold tracking-[-0.045em] sm:text-[34px]">Your people</h1>
+          <p className="mt-1 text-sm text-[#6F789A]">Add friends now so you can save toward shared goals together.</p>
+        </div>
+      )}
 
       {message && (
         <div

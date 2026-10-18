@@ -256,7 +256,7 @@ function GroupList({ onOpen }: { onOpen: (id: number) => void }) {
             </label>
             <p className={`${fieldLabel} mt-4`}>Invite friends</p>
             {friends.length === 0 ? (
-              <p className="text-xs text-[#8790AE]">You don't have any friends added yet. Add them by username on the Friends page, or invite them later.</p>
+              <p className="text-xs text-[#8790AE]">You don't have any friends added yet. Add them by username in Social → Friends, or invite them later.</p>
             ) : (
               <div className="flex flex-wrap gap-2">
                 {friends.map((f) => {
@@ -490,7 +490,7 @@ function GroupView({ groupId, meId, onBack }: { groupId: number; meId: number; o
             <div className="mt-5 border-t border-[#DADDF1] pt-4">
               <p className={fieldLabel}>Invite a friend</p>
               {g.invitable_friends.length === 0 ? (
-                <p className="text-[11px] text-[#8790AE]">All your friends are already here or invited. Add more on the Friends page.</p>
+                <p className="text-[11px] text-[#8790AE]">All your friends are already here or invited. Add more in Social → Friends.</p>
               ) : (
                 <form
                   className="flex gap-2"

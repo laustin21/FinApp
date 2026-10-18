@@ -8,6 +8,8 @@ the app already records:
   group_invite     you were invited to a group (still pending)
   group_activity   something happened in one of your groups (goals, savings,
                    joins...), done by someone other than you
+  cheer            a friend cheered you on from the leaderboard (budget.py)
+  reaction         a friend reacted to one of your updates in the Social feed (social.py)
 
 The only thing saved is when you last opened the bell (notification_reads), so
 items newer than that show as unread.
@@ -49,7 +51,7 @@ def _items(conn, user_id: int) -> list[dict]:
         items.append({
             "id": f"friend_request-{r['id']}", "kind": "friend_request", "created_at": r["created_at"],
             "title": f"{r['display_name']} sent you a friend request",
-            "body": f"@{r['username']} wants to connect.", "target": "Friends",
+            "body": f"@{r['username']} wants to connect.", "target": "Social",
         })
 
     for r in conn.execute(
@@ -61,7 +63,7 @@ def _items(conn, user_id: int) -> list[dict]:
         items.append({
             "id": f"friend_accepted-{r['id']}", "kind": "friend_accepted", "created_at": r["responded_at"],
             "title": f"{r['display_name']} accepted your friend request",
-            "body": "You can now invite them to groups.", "target": "Friends",
+            "body": "You can now invite them to groups.", "target": "Social",
         })
 
     for r in conn.execute(
@@ -88,6 +90,28 @@ def _items(conn, user_id: int) -> list[dict]:
         items.append({
             "id": f"group_activity-{r['id']}", "kind": "group_activity", "created_at": r["created_at"],
             "title": r["message"], "body": r["name"], "target": "Groups",
+        })
+
+    for r in conn.execute(
+        """SELECT c.id, c.created_at, u.display_name FROM budget_cheers c JOIN users u ON u.id = c.from_id
+           WHERE c.to_id = ? AND c.created_at >= ?""",
+        (user_id, since),
+    ):
+        items.append({
+            "id": f"cheer-{r['id']}", "kind": "cheer", "created_at": r["created_at"],
+            "title": f"{r['display_name']} cheered you on 👏",
+            "body": "Keep up the good budgeting this week!", "target": "Social",
+        })
+
+    for r in conn.execute(
+        """SELECT x.item_id, x.emoji, x.summary, x.created_at, u.display_name FROM feed_reactions x JOIN users u ON u.id = x.user_id
+           WHERE x.actor_id = ? AND x.user_id != ? AND x.created_at >= ?""",
+        (user_id, user_id, since),
+    ):
+        items.append({
+            "id": f"reaction-{r['item_id']}-{r['display_name']}-{r['emoji']}", "kind": "reaction", "created_at": r["created_at"],
+            "title": f"{r['display_name']} reacted {r['emoji']} to your update",
+            "body": r["summary"], "target": "Social",
         })
 
     items.sort(key=lambda i: i["created_at"] or "", reverse=True)

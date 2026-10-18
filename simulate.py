@@ -41,10 +41,16 @@ class SimulateIn(BaseModel):
 
 
 def _merchants() -> dict:
-    if DEMO_BANK.exists():
-        return {name: m["id"] for name, m in json.loads(DEMO_BANK.read_text())["merchants"].items()}
+    """{name: {"id", "category"}} for the demo merchants."""
+    from demo_setup import DEMO_BANK as SAVED, MERCHANTS
+    for path in (SAVED, DEMO_BANK):   # the data folder first (Railway), then next to this file
+        if path.exists():
+            return {name: {"id": m["id"], "category": m.get("category") or MERCHANTS.get(name, "")}
+                    for name, m in json.loads(path.read_text())["merchants"].items()}
     legacy = Path(__file__).with_name("merchants.json")
-    return json.loads(legacy.read_text()) if legacy.exists() else {}
+    if legacy.exists():
+        return {name: {"id": mid, "category": MERCHANTS.get(name, "")} for name, mid in json.loads(legacy.read_text()).items()}
+    return {}
 
 
 @router.get("/simulations")
@@ -74,10 +80,12 @@ def simulate(body: SimulateIn, user: dict = Depends(require_bank_link)):
         if kind == "deposit":
             banking.deposit(account["id"], cents, description, user_id=user["id"], source="simulation")
         else:
-            merchant_id = _merchants().get(merchant_name)
-            if not merchant_id:
+            m = _merchants().get(merchant_name)
+            if not m:
                 raise HTTPException(409, f"The merchant {merchant_name} isn't set up. Run demo_setup.py first.")
-            banking.remember_merchant(merchant_id, merchant_name, "")
+            merchant_id = m["id"]
+            # Remember its real category (e.g. Greenleaf Grocer -> Groceries) so budgets and insights file it correctly.
+            banking.remember_merchant(merchant_id, merchant_name, m["category"])
             banking.purchase(account["id"], merchant_id, cents, description, user_id=user["id"], source="simulation")
     except nessie.NessieError as e:
         raise HTTPException(502, f"The bank couldn't record it: {e}")

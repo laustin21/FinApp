@@ -58,8 +58,17 @@ button {
   transition: 150ms ease;
 }
 
+/* Phones: icon with a small label underneath. */
+.nav-item {
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 4px;
+  min-width: 52px;
+}
+
 .nav-item span:not(.ml-auto) {
-  display: none;
+  font-size: 9px;
+  line-height: 1;
 }
 
 .nav-item:hover {
@@ -155,12 +164,16 @@ button {
 
 @media (min-width: 1024px) {
   .nav-item {
+    flex-direction: row;
     justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 11px;
     font-size: 12px;
   }
 
   .nav-item span:not(.ml-auto) {
-    display: inline;
+    font-size: 12px;
+    line-height: inherit;
   }
 }
 

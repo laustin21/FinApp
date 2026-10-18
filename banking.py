@@ -93,24 +93,51 @@ def get_list(path: str) -> list:
 _get_list = get_list  # module-level name that account_transactions' local helper falls back to
 
 
+# The spending categories the app uses (dashboard, budgets, insights).
+CATEGORIES = ("Dining", "Groceries", "Shopping", "Transport", "Other")
+# Words in a merchant's name or Nessie category that tell us its category.
+_CATEGORY_HINTS = (
+    ("Groceries", ("grocer", "grocery", "groceries", "market", "supermarket", "foods", "produce", "pantry")),
+    ("Dining", ("dining", "restaurant", "coffee", "cafe", "café", "bar", "grill", "noodle", "pizza", "burger",
+                "kitchen", "bistro", "diner", "taco", "sushi", "bakery", "food", "eat", "juniper")),
+    ("Transport", ("transport", "ride", "taxi", "uber", "lyft", "fuel", "gas", "parking", "transit", "bus", "train", "auto")),
+    ("Shopping", ("shopping", "shop", "store", "outfitter", "apparel", "clothing", "loom", "boutique", "mall", "retail", "electronics")),
+)
+
+
+def categorize(name: str | None, category=None) -> str:
+    """One of CATEGORIES for a merchant. Uses its Nessie category when that's one of ours,
+    otherwise looks for hints in the category and name, otherwise "Other"."""
+    if isinstance(category, list):
+        category = category[0] if category else ""
+    raw = (category or "").strip()
+    for c in CATEGORIES:
+        if raw.lower() == c.lower():
+            return c
+    text = f"{raw} {name or ''}".lower()
+    for c, words in _CATEGORY_HINTS:
+        if any(w in text for w in words):
+            return c
+    return "Other"
+
+
 def merchant(merchant_id) -> dict:
     if not merchant_id:
         return {"name": "Unknown merchant", "category": "Other"}
     if merchant_id not in _merchant_cache:
         try:
             m = nessie._request("GET", f"/merchants/{merchant_id}")
-            category = m.get("category") or "Other"
-            if isinstance(category, list):
-                category = category[0] if category else "Other"
-            _merchant_cache[merchant_id] = {"name": m.get("name", "Unknown merchant"), "category": category}
+            name = m.get("name", "Unknown merchant")
+            _merchant_cache[merchant_id] = {"name": name, "category": categorize(name, m.get("category"))}
         except nessie.NessieError:
-            _merchant_cache[merchant_id] = {"name": "Unknown merchant", "category": "Other"}
+            # Don't remember a failed lookup: try again next time instead of filing everything under Other.
+            return {"name": "Unknown merchant", "category": "Other"}
     return _merchant_cache[merchant_id]
 
 
 def remember_merchant(merchant_id: str, name: str, category: str):
     """Skip a lookup for merchants we just created."""
-    _merchant_cache[merchant_id] = {"name": name, "category": category}
+    _merchant_cache[merchant_id] = {"name": name, "category": categorize(name, category)}
 
 
 def _day(value) -> date | None:
@@ -232,9 +259,17 @@ def _load_ledger(customer_id: str) -> dict:
     new_merchants = {p.get("merchant_id") for f in fetched.values() for p in f.get("purchases", [])} - set(_merchant_cache) - {None, ""}
     list(_pool.map(merchant, new_merchants))
 
+    # Nessie only stores a date, not a time. For transactions the app created we know the
+    # exact moment (nessie_activity), so same-day lines can be shown newest first.
+    with db.connect() as conn:
+        # "time#row" so two made in the same second still sort in the order they happened.
+        recorded = {r["nessie_id"]: f"{r['created_at']}#{r['id']:09d}" for r in conn.execute("SELECT id, nessie_id, created_at FROM nessie_activity")}
+
     lines, out = [], []
     for a in accounts:
         mine = account_transactions(a, names, hidden, fetched[a["_id"]])
+        for line in mine:
+            line["recorded_at"] = recorded.get(line["id"], "")
         lines.extend(mine)
         stored = float(a.get("balance") or 0)
         current = stored if NESSIE_UPDATES_BALANCE else stored + sum(l["amount"] for l in mine)

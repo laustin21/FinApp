@@ -60,7 +60,8 @@ def statement(period: str = "last_30_days", account_id: str = "", user: dict = D
         raise HTTPException(404, "That account isn't on your linked bank profile")
 
     lines = [l for l in ledger["lines"] if not account_id or l["account_id"] == account_id]
-    lines.sort(key=lambda l: (l["date"], _ORDER.get(l["type"], 9)))
+    # Oldest to newest: by date, then the exact time the app recorded it (if known), then type.
+    lines.sort(key=lambda l: (l["date"], l.get("recorded_at") or "", _ORDER.get(l["type"], 9)))
 
     # Running balance (one account only): start from the opening balance.
     if account_id:

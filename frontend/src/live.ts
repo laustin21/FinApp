@@ -2,10 +2,10 @@ import { useEffect, useRef } from "react";
 import { api, getToken } from "./api";
 
 // Live updates (live.py): one shared watcher asks the server every ~2 s whether
-// friends, groups or money changed, and tells subscribed pages to reload.
+// friends, groups, money or budgets changed, and tells subscribed pages to reload.
 // So when User A creates a goal, User B's open Groups page updates by itself.
 
-export type Topic = "friends" | "groups" | "money";
+export type Topic = "friends" | "groups" | "money" | "budget";
 type Versions = { boot: number } & Record<Topic, number>;
 
 const POLL_MS = 2000;
@@ -20,7 +20,7 @@ async function check() {
       const v = await api<Versions>("GET", "/api/live");
       if (last) {
         const restarted = v.boot !== last.boot;
-        const changed = (["friends", "groups", "money"] as Topic[]).filter((t) => restarted || v[t] !== last![t]);
+        const changed = (["friends", "groups", "money", "budget"] as Topic[]).filter((t) => restarted || v[t] !== last![t]);
         if (changed.length) listeners.forEach((l) => l.topics.some((t) => changed.includes(t)) && l.fn());
       }
       last = v;

@@ -72,16 +72,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import auth
 import bank
 import banking
+import budget
 import db
 import demo_setup
 import friends
 import gemini
 import goal_coach
 import groups
+import learn
 import live
 import nessie
 import notifications
 import simulate
+import social
 import solana_vault
 import statement
 
@@ -121,6 +124,9 @@ app.include_router(friends.router)
 app.include_router(groups.router)
 app.include_router(goal_coach.router)
 app.include_router(live.router)
+app.include_router(budget.router)
+app.include_router(learn.router)
+app.include_router(social.router)
 # Live updates: note every change so open apps refresh themselves (see live.py).
 app.middleware("http")(live.middleware)
 app.include_router(statement.router)
@@ -174,7 +180,8 @@ def _customer_purchases(ledger):
     """Purchases across all accounts (hidden/undone ones are already left out)."""
     return [
         {"id": l["id"], "date": l["date"], "amount": -l["amount"], "merchant": l.get("merchant", "Unknown merchant"),
-         "category": l["category"] or "Other", "description": l["description"].split(" · ", 1)[-1] if " · " in l["description"] else ""}
+         "category": l["category"] or "Other", "description": l["description"].split(" · ", 1)[-1] if " · " in l["description"] else "",
+         "recorded_at": l.get("recorded_at") or ""}
         for l in ledger["lines"] if l["type"] == "Purchase"
     ]
 
@@ -233,7 +240,7 @@ def dashboard(period: str = "this_month", user: dict = Depends(bank.require_bank
         reverse=True,
     )
 
-    recent = sorted(current, key=lambda p: p["date"], reverse=True)[:8]
+    recent = sorted(current, key=lambda p: (p["date"], p["recorded_at"]), reverse=True)[:8]
 
     result = {
         "customer": {"id": customer_id, "first_name": customer["first_name"], "last_name": customer["last_name"]},
