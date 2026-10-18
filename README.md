@@ -235,10 +235,10 @@ To put everything back to the starting state, stop the server and run `reset_dem
 
 ## Team
 
-Austin Le - Full-Stack Developer & QA Engineer
-Alwin Chen - Backend Developer & Subject Matter Expert
-Mandy Hong - Project Manager & Frontend Developer
-John Zhou Su - Frontend Developer & UI/UX Designer
+- Austin Le: Full-Stack Developer & QA Engineer
+- Alwin Chen: Backend Developer & Subject Matter Expert
+- Mandy Hong: Project Manager & Frontend Developer
+- John Zhou Su: Frontend Developer & UI/UX Designer
 
 ## What's next
 
