@@ -40,8 +40,8 @@ import nessie
 from auth import hash_password
 
 HERE = Path(__file__).parent
-DEMO_BANK = HERE / "demo_bank.json"
-BASELINE = HERE / "demo_baseline.db"
+DEMO_BANK = db.DATA_DIR / "demo_bank.json"
+BASELINE = db.DATA_DIR / "demo_baseline.db"
 DEMO_PASSWORD = "demo1234"
 
 END = date.today() - timedelta(days=1)       # history ends yesterday
@@ -236,7 +236,7 @@ def create_merchants() -> dict:
     return merchants
 
 
-def setup(force: bool = False):
+def setup(force: bool = False, workers: int = 8):
     if DEMO_BANK.exists() and not force:
         print("The demo is already set up (demo_bank.json exists), so nothing was changed.")
         print("To put the demo back to its baseline, run reset_demo.py.")
@@ -278,7 +278,7 @@ def setup(force: bool = False):
             conn.execute("INSERT INTO bank_links (user_id, nessie_customer_id, linked_at) VALUES (?, ?, ?)",
                          (uid, customer_id, stamp(START, 12)))
 
-        count, balance = build_history(p, accounts, merchants, uid)
+        count, balance = build_history(p, accounts, merchants, uid, workers=workers)
         saved["people"][p["username"]] = {"customer_id": customer_id,
                                           "accounts": {nick: aid for (_, nick, _), aid in zip(p["accounts"], accounts)}}
         print(f"@{p['username']}: bank profile {customer_id}, {count} transactions, "
@@ -298,6 +298,11 @@ def setup(force: bool = False):
         goal_id = conn.execute(
             "INSERT INTO goals (group_id, title, target_cents, deadline, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (gid, GROUP["goal"], GROUP["target_cents"], deadline.isoformat(), maya, stamp(goal_created, 14))).lastrowid
+        # Goal rules (groups.py): weekly payments, and an honor-code dare for missing one.
+        conn.execute("UPDATE goals SET frequency = 'weekly', penalty_type = 'honor', penalty_dare = ?, pace = 'Steady', "
+                     "realism_score = 8, realism_note = ? WHERE id = ?",
+                     ("Buy the group's next round of coffee",
+                      "About $42 a week each fits comfortably alongside part-time paychecks.", goal_id))
         log = [(maya, "create", "Maya Johnson created the group", stamp(goal_created, 14)),
                (maya, "goal", f"Maya Johnson created the goal “{GROUP['goal']}”: $3,000.00 by {deadline:%b %d, %Y}", stamp(goal_created, 14))]
         for i, (uid, name) in enumerate(((maya, "Maya Johnson"), (carlos, "Carlos Rivera"), (priya, "Priya Patel"))):
@@ -334,6 +339,59 @@ def setup(force: bool = False):
         conn.execute("VACUUM INTO ?", (str(BASELINE),))
     print(f"Saved the baseline ({BASELINE.name}, {DEMO_BANK.name}). reset_demo.py returns to it any time.")
     print(f"\nDone! Log in as maya, carlos or priya (password {DEMO_PASSWORD}).")
+
+
+# ---------- Automatic setup when the server starts ----------
+# Railway starts every deploy with an empty app.db, so the demo users (and the
+# one-click demo logins) would be missing until someone ran this script by hand.
+# server.py calls ensure_demo() at startup instead:
+#   - demo users already there              -> nothing to do
+#   - empty app.db + a saved baseline        -> restore the baseline (instant)
+#   - empty app.db and no baseline           -> build the demo in the background (~1 min)
+#   - real profiles but no demo users        -> leave everything alone
+# Only in demo mode (FINAPP_DEV not 0). FINAPP_AUTO_DEMO=0 turns it off.
+demo_status = {"status": "unknown"}   # ready | building | failed | off | missing
+
+
+def _has_users(conn, demo_only=False) -> bool:
+    sql = "SELECT 1 FROM users" + (" WHERE is_demo = 1" if demo_only else "") + " LIMIT 1"
+    return conn.execute(sql).fetchone() is not None
+
+
+def ensure_demo():
+    import os
+    import threading
+    import auth
+    if not auth.DEV_MODE or os.getenv("FINAPP_AUTO_DEMO", "1") == "0":
+        demo_status["status"] = "off"
+        return
+    with db.connect() as conn:
+        has_demo, has_any = _has_users(conn, demo_only=True), _has_users(conn)
+    if has_demo:
+        demo_status["status"] = "ready"
+        return
+    if has_any:
+        demo_status["status"] = "missing"
+        print("Demo users are missing but other profiles exist, so the demo wasn't set up automatically. Run demo_setup.py.")
+        return
+    if BASELINE.exists():
+        shutil.copyfile(BASELINE, db.DB_PATH)
+        db.init()
+        demo_status["status"] = "ready"
+        print("Restored the demo baseline (maya, carlos, priya).")
+        return
+
+    def build():
+        try:
+            setup(force=True)
+            demo_status["status"] = "ready"
+        except Exception as e:
+            demo_status["status"] = "failed"
+            print(f"Automatic demo setup failed: {e}")
+
+    demo_status["status"] = "building"
+    print("No demo users yet: building them in the background (about a minute)...")
+    threading.Thread(target=build, daemon=True, name="demo-setup").start()
 
 
 if __name__ == "__main__":

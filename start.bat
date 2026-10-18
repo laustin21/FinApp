@@ -11,6 +11,9 @@ if not exist venv\Scripts\python.exe (
   python -m venv venv
   venv\Scripts\pip install -r requirements.txt
 )
+REM Pick up any new backend packages (quick when nothing is missing).
+venv\Scripts\python.exe -m pip install -q -r requirements.txt
+
 if not exist frontend\node_modules (
   echo Installing the frontend for the first time...
   pushd frontend

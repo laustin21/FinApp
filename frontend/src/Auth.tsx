@@ -20,9 +20,29 @@ export default function Auth({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [demoUsers, setDemoUsers] = useState<DemoUser[]>([]);
+  const [demoBuilding, setDemoBuilding] = useState(false);
 
+  // Demo logins. Right after a fresh deploy the server builds the demo users in the
+  // background (about a minute): say so, and show the buttons as soon as they exist.
   useEffect(() => {
-    api<DemoUser[]>("GET", "/api/dev/demo-users").then(setDemoUsers).catch(() => setDemoUsers([]));
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      const users = await api<DemoUser[]>("GET", "/api/dev/demo-users").catch(() => [] as DemoUser[]);
+      if (stop) return;
+      setDemoUsers(users);
+      if (users.length) return setDemoBuilding(false);
+      const s = await api<{ status: string }>("GET", "/api/dev/demo-status").catch(() => null);
+      if (stop) return;
+      const building = s?.status === "building";
+      setDemoBuilding(building);
+      if (building) timer = setTimeout(check, 4000);
+    };
+    check();
+    return () => {
+      stop = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   // While creating a profile, check the username as you type (after a short pause).
@@ -172,6 +192,15 @@ export default function Auth({ onLoggedIn }: { onLoggedIn: () => void }) {
           </p>
         </div>
 
+        {demoUsers.length === 0 && demoBuilding && (
+          <div className="mt-5 flex items-center gap-3 rounded-[20px] border border-dashed border-[#C4CAE3] p-5" role="status">
+            <span className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-[#95A1D8] border-t-transparent" />
+            <div>
+              <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-[#6F789A]">Demo mode</p>
+              <p className="mt-1 text-xs text-[#6F789A]">Setting up the demo accounts. They'll appear here in about a minute.</p>
+            </div>
+          </div>
+        )}
         {demoUsers.length > 0 && (
           <div className="mt-5 rounded-[20px] border border-dashed border-[#C4CAE3] p-5">
             <p className="text-[11px] font-bold uppercase tracking-[0.1em] text-[#6F789A]">Demo mode</p>

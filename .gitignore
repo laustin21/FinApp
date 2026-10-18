@@ -29,3 +29,6 @@ merchants.json
 # Frontend build output (also covered by frontend/.gitignore)
 node_modules/
 dist/
+
+# The app's Solana devnet wallet (solana_vault.py). Keep it private.
+solana_authority.json

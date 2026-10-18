@@ -49,11 +49,21 @@ Groups and shared goals (groups.py):
 Notifications (notifications.py):
   GET  /api/notifications                  -> {unread_count, items}
   POST /api/notifications/seen
+Gemini goal coach (goal_coach.py):
+  POST /api/groups/{id}/goal-coach {messages}  -> {reply, chips, ready, plan, math}
+  PUT  /api/goals/{id}/terms {frequency, penalty_type, penalty_percent, penalty_dare, ...}
+Solana vaults (solana_vault.py):
+  GET  /api/solana/status          -> network, app wallet, token, queue
+  GET  /api/goals/{id}/vault        -> on-chain balance vs app ledger, members, transactions
+Gemini status (gemini.py):
+  GET  /api/ai/status        -> {state, latency_ms, model, error}
+  POST /api/ai/status/check  -> same, after a live test prompt
 AI insights (gemini.py, needs GEMINI_API_KEY in .env):
   GET /api/me/insights?period=this_month   -> {available, insights: {headline, persona, insights, tips}}
 """
 import os
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -63,15 +73,29 @@ import auth
 import bank
 import banking
 import db
+import demo_setup
 import friends
 import gemini
+import goal_coach
 import groups
 import nessie
 import notifications
 import simulate
+import solana_vault
 import statement
 
-app = FastAPI(title="finapp backend")
+@asynccontextmanager
+async def _lifespan(_app):
+    # Fresh database (e.g. a new Railway deploy)? Set up the demo users automatically.
+    demo_setup.ensure_demo()
+    # Load Gemini and test the key in the background, so the first AI request is faster.
+    gemini.warm_up()
+    # Record group-goal savings on Solana (devnet) in the background.
+    solana_vault.start_worker()
+    yield
+
+
+app = FastAPI(title="finapp backend", lifespan=_lifespan)
 
 # Which websites may call this API: the deployed frontend on Railway plus local
 # development (the Vite dev server runs on port 8443). To allow another site,
@@ -94,9 +118,34 @@ app.include_router(auth.router)
 app.include_router(bank.router)
 app.include_router(friends.router)
 app.include_router(groups.router)
+app.include_router(goal_coach.router)
 app.include_router(statement.router)
 app.include_router(simulate.router)
 app.include_router(notifications.router)
+
+@app.get("/api/ai/status")
+def ai_status():
+    """Is Gemini set up and answering? {state: online|offline|checking|not_configured, latency_ms, model, error}"""
+    return gemini.status()
+
+
+@app.post("/api/ai/status/check")
+def ai_status_check(user: dict = Depends(auth.current_user)):
+    """Send Gemini a tiny test prompt right now (the header's "Test now")."""
+    return gemini.check()
+
+
+@app.get("/api/solana/status")
+def solana_status():
+    """The app's Solana setup: network, app wallet + fee balance, GSD token, queue size."""
+    return solana_vault.status()
+
+
+@app.get("/api/dev/demo-status")
+def demo_status():
+    """Whether the one-click demo logins are ready, still being built, or off."""
+    return {"enabled": auth.DEV_MODE, "status": demo_setup.demo_status["status"]}
+
 
 def _period_range(period, today=None):
     """Return (start, end, previous_start, previous_end) as dates, end inclusive."""
@@ -182,7 +231,7 @@ def dashboard(period: str = "this_month", user: dict = Depends(bank.require_bank
 
     recent = sorted(current, key=lambda p: p["date"], reverse=True)[:8]
 
-    return {
+    result = {
         "customer": {"id": customer_id, "first_name": customer["first_name"], "last_name": customer["last_name"]},
         "period": {"key": period, "start": start.isoformat(), "end": end.isoformat()},
         "total": total,
@@ -198,6 +247,10 @@ def dashboard(period: str = "this_month", user: dict = Depends(bank.require_bank
             {**p, "date": p["date"].isoformat()} for p in recent
         ],
     }
+    # Start Gemini on these numbers now, in the background, so Insights is ready sooner.
+    if current:
+        gemini.prewarm(_insight_summary(result))
+    return result
 
 
 def _insight_summary(d: dict) -> dict:

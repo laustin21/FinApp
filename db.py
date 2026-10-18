@@ -12,11 +12,17 @@ Friends, groups and goals always point at app user IDs, never Nessie IDs,
 so they keep working if someone unlinks or switches banks.
 """
 import sqlite3
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("app.db")
+# Where app.db (and the demo baseline files) live. Defaults to this folder.
+# On Railway, point FINAPP_DATA_DIR at a mounted Volume (e.g. /data) so accounts
+# and demo data survive redeploys.
+DATA_DIR = Path(os.getenv("FINAPP_DATA_DIR") or Path(__file__).parent)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "app.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -209,6 +215,22 @@ def _add_missing_columns(conn):
     for column in ("nessie_type", "nessie_id", "account_id"):
         if column not in have:
             conn.execute(f"ALTER TABLE contributions ADD COLUMN {column} TEXT")
+
+    # Goal terms (groups.py): payment schedule, missed-payment penalty, and the
+    # Gemini goal coach's read on how realistic the goal is.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(goals)")}
+    for column, kind in (
+        ("frequency", "TEXT NOT NULL DEFAULT 'none'"),      # none | weekly | biweekly | monthly
+        ("penalty_type", "TEXT NOT NULL DEFAULT 'none'"),   # none | money | honor
+        ("penalty_percent", "REAL NOT NULL DEFAULT 0"),     # money: % added to a missed payment
+        ("penalty_dare", "TEXT"),                           # honor: what someone who misses has to do
+        ("pace", "TEXT"),                                   # e.g. "Steady", from the coach
+        ("realism_score", "INTEGER"),                       # 1-10, from the coach
+        ("realism_note", "TEXT"),
+        ("coach_summary", "TEXT"),
+    ):
+        if column not in have:
+            conn.execute(f"ALTER TABLE goals ADD COLUMN {column} {kind}")
 
 
 def init():

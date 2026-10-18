@@ -20,9 +20,18 @@ Adding money to a goal is a real withdrawal from your linked bank account in
 Nessie (see banking.py), so it shows on your statement and lowers your balance.
 Undoing it takes that withdrawal back (Nessie can't delete withdrawals, so the
 app hides it), returning the money to your balance.
+
+Goal terms (optional, set by hand or filled in by the Gemini goal coach, goal_coach.py):
+  - frequency: weekly / biweekly / monthly. Each member's share is split into equal
+    payments, due from when THEY committed until the deadline.
+  - a payment is MISSED if, by its due date, that member's savings are below what
+    they should have paid so far. Missed payments stay on the record.
+  - penalty_type "money": each missed payment adds penalty_percent of one payment to
+    that member's total (their share goes up). "honor": each missed payment means
+    they owe the group the agreed dare (enforced by the friend group, shown here).
 """
 import math
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -30,6 +39,7 @@ from pydantic import BaseModel
 import banking
 import db
 import nessie
+import solana_vault
 from auth import current_user, public_user
 from friends import friend_ids
 
@@ -96,6 +106,79 @@ def _time_elapsed_fraction(created_at: str, deadline: str, today: date) -> float
     return min(1.0, max(0.0, (today - start).days / (end - start).days))
 
 
+FREQUENCIES = ("none", "weekly", "biweekly", "monthly")
+PENALTY_TYPES = ("none", "money", "honor")
+
+
+def _add_months(d: date, months: int) -> date:
+    y, m = divmod(d.month - 1 + months, 12)
+    year, month = d.year + y, m + 1
+    days_in_month = [31, 29 if year % 4 == 0 and (year % 100 or year % 400 == 0) else 28,
+                     31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    return date(year, month, min(d.day, days_in_month))
+
+
+def due_dates(start: date, deadline: date, frequency: str) -> list[date]:
+    """When each payment is due: one per period after `start`, the last on the deadline."""
+    if frequency not in ("weekly", "biweekly", "monthly") or deadline <= start:
+        return [deadline]
+    dates, k = [], 1
+    while True:
+        d = _add_months(start, k) if frequency == "monthly" else start + timedelta(days=7 * k * (2 if frequency == "biweekly" else 1))
+        if d >= deadline:
+            break
+        dates.append(d)
+        k += 1
+    return dates + [deadline]
+
+
+def member_schedule(goal, share: int, committed_at: str, entries: list, today: date) -> dict | None:
+    """One member's payment plan, missed payments and penalty (all in cents), or None
+    if the goal has no payment schedule. `entries` = [(created_at, amount_cents), ...]."""
+    frequency = goal["frequency"] if "frequency" in goal.keys() else "none"
+    if frequency not in ("weekly", "biweekly", "monthly"):
+        return None
+    dues = due_dates(date.fromisoformat(committed_at[:10]), date.fromisoformat(goal["deadline"]), frequency)
+    payment = share / len(dues)
+    passed = [d for d in dues if d < today]
+    missed = 0
+    for k, d in enumerate(passed, start=1):
+        paid_by_then = sum(c for when, c in entries if date.fromisoformat(when[:10]) <= d)
+        if paid_by_then + 1 < round(payment * k):  # 1 cent of rounding slack
+            missed += 1
+    have = sum(c for _, c in entries)
+    penalty = round(missed * payment * goal["penalty_percent"] / 100) if goal["penalty_type"] == "money" else 0
+    total_owed = share + penalty
+    upcoming = next((d for d in dues if d >= today), None)
+    next_amount = max(0, min(total_owed - have, round(payment * (len(passed) + 1)) + penalty - have))
+    return {
+        "payment": dollars(round(payment)),
+        "payments_total": len(dues),
+        "payments_due_so_far": len(passed),
+        "next_due": upcoming.isoformat() if upcoming else None,
+        "next_amount": dollars(next_amount),
+        "missed": missed,
+        "penalty_owed": dollars(penalty),
+        "total_owed": dollars(total_owed),
+        "dares_owed": missed if goal["penalty_type"] == "honor" else 0,
+    }
+
+
+def goal_terms(goal) -> dict:
+    keys = goal.keys()
+    get = lambda k, default=None: goal[k] if k in keys and goal[k] is not None else default
+    return {
+        "frequency": get("frequency", "none"),
+        "penalty_type": get("penalty_type", "none"),
+        "penalty_percent": get("penalty_percent", 0),
+        "penalty_dare": get("penalty_dare", ""),
+        "pace": get("pace", ""),
+        "realism_score": get("realism_score"),
+        "realism_note": get("realism_note", ""),
+        "coach_summary": get("coach_summary", ""),
+    }
+
+
 def goal_progress(conn, goal, viewer_id: int, today: date | None = None) -> dict:
     """Everything the UI shows about one goal: totals, pace, and each member's status."""
     today = today or date.today()
@@ -110,6 +193,9 @@ def goal_progress(conn, goal, viewer_id: int, today: date | None = None) -> dict
     saved = {r["user_id"]: r["total"] for r in conn.execute(
         "SELECT user_id, SUM(amount_cents) AS total FROM contributions WHERE goal_id = ? GROUP BY user_id",
         (goal["id"],))}
+    entries: dict = {}
+    for r in conn.execute("SELECT user_id, amount_cents, created_at FROM contributions WHERE goal_id = ?", (goal["id"],)):
+        entries.setdefault(r["user_id"], []).append((r["created_at"], r["amount_cents"]))
 
     elapsed = _time_elapsed_fraction(goal["created_at"], goal["deadline"], today)
     target = goal["target_cents"]
@@ -119,14 +205,23 @@ def goal_progress(conn, goal, viewer_id: int, today: date | None = None) -> dict
     rows = []
     for m in members:
         share, have = shares.get(m["id"]), saved.get(m["id"], 0)
+        schedule = None
         if share is None:
             status, expected = "not_committed", 0
         else:
             # Each person's pace starts when THEY committed, so late joiners aren't instantly "behind".
             mine = _time_elapsed_fraction(commitments[m["id"]]["committed_at"], goal["deadline"], today)
             expected = round(share * mine)
-            status = "complete" if have >= share else "on_track" if have >= expected else "behind"
+            schedule = member_schedule(goal, share, commitments[m["id"]]["committed_at"], entries.get(m["id"], []), today)
+            owed = round(schedule["total_owed"] * 100) if schedule else share
+            if have >= owed:
+                status = "complete"
+            elif schedule and schedule["missed"]:
+                status = "behind"
+            else:
+                status = "on_track" if have >= expected else "behind"
         rows.append({
+            "schedule": schedule,
             "person": public_user(m),
             "share": dollars(share) if share else None,
             "saved": dollars(have),
@@ -165,6 +260,7 @@ def goal_progress(conn, goal, viewer_id: int, today: date | None = None) -> dict
         "my_share": dollars(shares[viewer_id]) if viewer_id in shares else None,
         "suggested_share": dollars(math.ceil(target / max(1, len(members)))),
         "members": rows,
+        "terms": goal_terms(goal),
     }
 
 
@@ -179,7 +275,18 @@ class InviteIn(BaseModel):
     user_id: int
 
 
-class GoalIn(BaseModel):
+class TermsIn(BaseModel):
+    frequency: str = "none"          # none | weekly | biweekly | monthly
+    penalty_type: str = "none"       # none | money | honor
+    penalty_percent: float = 0       # money: % of one payment added per missed payment
+    penalty_dare: str = ""           # honor: the dare someone who misses owes the group
+    pace: str = ""
+    realism_score: int | None = None
+    realism_note: str = ""
+    coach_summary: str = ""
+
+
+class GoalIn(TermsIn):
     title: str
     target_amount: float
     deadline: str  # YYYY-MM-DD
@@ -419,15 +526,72 @@ def create_goal(group_id: int, body: GoalIn, user: dict = Depends(current_user))
     if deadline <= date.today():
         raise HTTPException(400, "Pick a deadline in the future")
 
+    terms = _clean_terms(body)
     with db.connect() as conn:
         _require_group_member(conn, group_id, user["id"])
         goal_id = conn.execute(
-            "INSERT INTO goals (group_id, title, target_cents, deadline, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (group_id, title[:80], target, deadline.isoformat(), user["id"], db.now()),
+            "INSERT INTO goals (group_id, title, target_cents, deadline, created_by, created_at, frequency, penalty_type, "
+            "penalty_percent, penalty_dare, pace, realism_score, realism_note, coach_summary) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (group_id, title[:80], target, deadline.isoformat(), user["id"], db.now(), *terms.values()),
         ).lastrowid
         _log(conn, group_id, user["id"], "goal",
              f"{user['display_name']} created the goal “{title[:80]}”: ${dollars(target):,.2f} by {deadline:%b %d, %Y}")
+        if terms["frequency"] != "none" or terms["penalty_type"] != "none":
+            _log(conn, group_id, user["id"], "terms", f"Terms for “{title[:80]}”: {describe_terms(terms)}")
     return {"id": goal_id}
+
+
+def _clean_terms(body: TermsIn) -> dict:
+    if body.frequency not in FREQUENCIES:
+        raise HTTPException(400, f"frequency must be one of: {', '.join(FREQUENCIES)}")
+    if body.penalty_type not in PENALTY_TYPES:
+        raise HTTPException(400, f"penalty_type must be one of: {', '.join(PENALTY_TYPES)}")
+    percent = float(body.penalty_percent or 0)
+    if body.penalty_type == "money" and not 0 < percent <= 100:
+        raise HTTPException(400, "Pick a penalty between 1% and 100% of a payment")
+    dare = body.penalty_dare.strip()[:160]
+    if body.penalty_type == "honor" and not dare:
+        raise HTTPException(400, "Describe the dare for missing a payment")
+    score = body.realism_score
+    return {
+        "frequency": body.frequency,
+        "penalty_type": body.penalty_type,
+        "penalty_percent": percent if body.penalty_type == "money" else 0,
+        "penalty_dare": dare if body.penalty_type == "honor" else "",
+        "pace": body.pace.strip()[:40],
+        "realism_score": max(1, min(10, int(score))) if score is not None else None,
+        "realism_note": body.realism_note.strip()[:300],
+        "coach_summary": body.coach_summary.strip()[:600],
+    }
+
+
+def describe_terms(t: dict) -> str:
+    parts = [f"{t['frequency']} payments" if t["frequency"] != "none" else "no payment schedule"]
+    if t["penalty_type"] == "money":
+        parts.append(f"a missed payment adds {t['penalty_percent']:g}% of a payment")
+    elif t["penalty_type"] == "honor":
+        parts.append(f"a missed payment means: {t['penalty_dare']}")
+    return "; ".join(parts)
+
+
+@router.put("/goals/{goal_id}/terms")
+def set_terms(goal_id: int, body: TermsIn, user: dict = Depends(current_user)):
+    """Set or change a goal's payment schedule and missed-payment penalty."""
+    terms = _clean_terms(body)
+    with db.connect() as conn:
+        goal = _goal_for_member(conn, goal_id, user["id"])
+        owner = conn.execute("SELECT owner_id FROM groups WHERE id = ?", (goal["group_id"],)).fetchone()["owner_id"]
+        if user["id"] not in (goal["created_by"], owner):
+            raise HTTPException(403, "Only the person who created this goal, or the group owner, can change its terms")
+        conn.execute(
+            "UPDATE goals SET frequency = ?, penalty_type = ?, penalty_percent = ?, penalty_dare = ?, pace = ?, "
+            "realism_score = ?, realism_note = ?, coach_summary = ? WHERE id = ?",
+            (*terms.values(), goal_id),
+        )
+        _log(conn, goal["group_id"], user["id"], "terms",
+             f"{user['display_name']} set the terms for “{goal['title']}”: {describe_terms(terms)}")
+    return {"terms": terms}
 
 
 @router.delete("/goals/{goal_id}")
@@ -440,6 +604,7 @@ def delete_goal(goal_id: int, user: dict = Depends(current_user)):
             raise HTTPException(403, "Only the person who created this goal, or the group owner, can delete it")
         conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
         _log(conn, goal["group_id"], user["id"], "goal_deleted", f"{user['display_name']} deleted the goal “{goal['title']}”")
+    solana_vault.enqueue_goal_refunds(goal_id, goal["title"])
     return {"status": "deleted"}
 
 
@@ -521,8 +686,23 @@ def add_contribution(goal_id: int, body: ContributionIn, user: dict = Depends(cu
         ).lastrowid
         _log(conn, goal["group_id"], user["id"], "contribution",
              f"{user['display_name']} moved ${dollars(amount):,.2f} into “{goal['title']}”")
+    # Record it in the goal's on-chain vault (Solana). Queued, so the bank side never waits.
+    solana_vault.enqueue_deposit(cid, goal_id, user["id"], amount,
+                                 solana_vault.deposit_memo(goal_id, goal["title"], cid, amount, nessie_id))
     return {"id": cid, "from_account": account["nickname"],
             "new_balance": round(account["balance"] - amount / 100, 2), "nessie_id": nessie_id}
+
+
+@router.get("/goals/{goal_id}/vault")
+def goal_vault(goal_id: int, user: dict = Depends(current_user)):
+    """The goal's on-chain vault: balance on Solana vs the app's records, who put in what, transactions."""
+    with db.connect() as conn:
+        goal = _goal_for_member(conn, goal_id, user["id"])
+        names = {r["id"]: r["display_name"] for r in conn.execute(
+            "SELECT u.id, u.display_name FROM users u JOIN contributions c ON c.user_id = u.id WHERE c.goal_id = ? "
+            "UNION SELECT u.id, u.display_name FROM users u JOIN group_members m ON m.user_id = u.id WHERE m.group_id = ?",
+            (goal_id, goal["group_id"]))}
+    return solana_vault.vault_info(goal_id, names)
 
 
 @router.delete("/contributions/{contribution_id}")
@@ -547,4 +727,7 @@ def undo_contribution(contribution_id: int, user: dict = Depends(current_user)):
         conn.execute("DELETE FROM contributions WHERE id = ?", (contribution_id,))
         _log(conn, row["group_id"], user["id"], "contribution_removed",
              f"{user['display_name']} took back ${dollars(row['amount_cents']):,.2f} from “{row['title']}”")
+    # Take its GSD back out of the goal's on-chain vault (after the database write above is done).
+    solana_vault.enqueue_refund(contribution_id, f"Gatorstar | goal {row['goal_id']} | contribution {contribution_id} undone | "
+                                                 f"${dollars(row['amount_cents']):,.2f} back to the member")
     return {"status": how}

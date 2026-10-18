@@ -1,11 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { initials } from "./Friends";
+import { ChainBadge, VaultPanel, useVault } from "./Vault";
+import { GoalCoach, NO_TERMS, Realism, TermsFields, describePenalty, type CoachPlan, type Terms } from "./GoalCoach";
 
 // ---------- Types (match groups.py) ----------
 type Person = { id: number; username: string; display_name: string };
 type Status = "on_track" | "behind" | "complete" | "not_committed" | "missed";
-type MemberProgress = { person: Person; share: number | null; saved: number; expected_by_now: number; percent: number; status: Status };
+type Schedule = {
+  payment: number;
+  payments_total: number;
+  payments_due_so_far: number;
+  next_due: string | null;
+  next_amount: number;
+  missed: number;
+  penalty_owed: number;
+  total_owed: number;
+  dares_owed: number;
+};
+type MemberProgress = { person: Person; share: number | null; saved: number; expected_by_now: number; percent: number; status: Status; schedule: Schedule | null };
 type Goal = {
   id: number;
   title: string;
@@ -23,6 +36,7 @@ type Goal = {
   my_share: number | null;
   suggested_share: number;
   members: MemberProgress[];
+  terms: Terms;
 };
 type GroupSummary = {
   id: number;
@@ -316,7 +330,14 @@ function GroupList({ onOpen }: { onOpen: (id: number) => void }) {
 function GroupView({ groupId, meId, onBack }: { groupId: number; meId: number; onBack: () => void }) {
   const [g, setG] = useState<GroupDetail | null>(null);
   const [inviteId, setInviteId] = useState("");
-  const [showNewGoal, setShowNewGoal] = useState(false);
+  // New goal: "coach" = Gemini guided chat, "form" = the goal form (maybe prefilled by the coach).
+  const [newGoal, setNewGoal] = useState<null | "coach" | "form">(null);
+  const [coachPlan, setCoachPlan] = useState<CoachPlan | null>(null);
+  const showNewGoal = newGoal !== null;
+  const openNewGoal = (mode: "coach" | "form") => {
+    setCoachPlan(null);
+    setNewGoal(mode);
+  };
   const [confirmLeave, setConfirmLeave] = useState(false);
 
   const [funding, setFunding] = useState<Funding | null>(null);
@@ -359,26 +380,56 @@ function GroupView({ groupId, meId, onBack }: { groupId: number; meId: number; o
             <span className="text-xs text-[#6F789A]">{g.members.map((m) => m.display_name.split(" ")[0]).join(", ")}</span>
           </div>
         </div>
-        <button className={`${primaryBtn} !px-5 !py-3`} onClick={() => setShowNewGoal(true)}>
-          + New goal
-        </button>
+        <div className="flex gap-2">
+          <button className={`${secondaryBtn} !px-4 !py-3`} onClick={() => openNewGoal("form")}>
+            + New goal
+          </button>
+          <button className={`${primaryBtn} !px-5 !py-3`} onClick={() => openNewGoal("coach")}>
+            ✦ Plan a goal with Gemini
+          </button>
+        </div>
       </div>
 
       <Notice message={message} />
 
       <div className="grid gap-5 xl:grid-cols-[1.6fr_1fr]">
         <div className="space-y-5">
-          {showNewGoal && <NewGoalForm busy={busy} onCancel={() => setShowNewGoal(false)} onCreate={async (body) => {
-            if (await run(() => api("POST", `/api/groups/${g.id}/goals`, body), `Created the goal “${body.title}”. Everyone can now commit their share.`)) setShowNewGoal(false);
-          }} />}
+          {newGoal === "coach" && (
+            <GoalCoach
+              groupId={g.id}
+              key={`coach-${g.id}`}
+              onSkip={() => setNewGoal("form")}
+              onUsePlan={(plan) => {
+                setCoachPlan(plan);
+                setNewGoal("form");
+              }}
+            />
+          )}
+          {newGoal === "form" && (
+            <NewGoalForm
+              busy={busy}
+              fromCoach={coachPlan}
+              key={coachPlan ? `plan-${coachPlan.title}-${coachPlan.deadline}` : "blank"}
+              onBackToCoach={() => setNewGoal("coach")}
+              onCancel={() => setNewGoal(null)}
+              onCreate={async (body) => {
+                if (await run(() => api("POST", `/api/groups/${g.id}/goals`, body), `Created the goal “${body.title}”. Everyone can now commit their share.`)) setNewGoal(null);
+              }}
+            />
+          )}
 
           {g.goals.length === 0 && !showNewGoal && (
             <section className="panel text-center">
               <p className="text-sm font-bold">No shared goals yet</p>
-              <p className="mx-auto mt-1 max-w-sm text-xs text-[#8790AE]">Set a target and a deadline, and everyone in the group commits their share.</p>
-              <button className={`${primaryBtn} mt-4`} onClick={() => setShowNewGoal(true)}>
-                Create the first goal
-              </button>
+              <p className="mx-auto mt-1 max-w-sm text-xs text-[#8790AE]">Set a target, a deadline and the rules, and everyone in the group commits their share.</p>
+              <div className="mt-4 flex justify-center gap-2">
+                <button className={primaryBtn} onClick={() => openNewGoal("coach")}>
+                  ✦ Plan it with Gemini
+                </button>
+                <button className={secondaryBtn} onClick={() => openNewGoal("form")}>
+                  Fill it in myself
+                </button>
+              </div>
             </section>
           )}
 
@@ -514,21 +565,64 @@ function BackLink({ onBack }: { onBack: () => void }) {
   );
 }
 
-function NewGoalForm({ busy, onCreate, onCancel }: { busy: boolean; onCreate: (b: { title: string; target_amount: number; deadline: string }) => void; onCancel: () => void }) {
-  const [title, setTitle] = useState("");
-  const [target, setTarget] = useState("");
-  const [deadline, setDeadline] = useState("");
+type NewGoalBody = { title: string; target_amount: number; deadline: string } & Terms;
+
+function NewGoalForm({
+  busy,
+  fromCoach,
+  onCreate,
+  onCancel,
+  onBackToCoach,
+}: {
+  busy: boolean;
+  fromCoach: CoachPlan | null;
+  onCreate: (b: NewGoalBody) => void;
+  onCancel: () => void;
+  onBackToCoach: () => void;
+}) {
+  // Gemini's plan (if any) fills in the blanks; everything stays editable.
+  const [title, setTitle] = useState(fromCoach?.title ?? "");
+  const [target, setTarget] = useState(fromCoach ? String(fromCoach.target_amount) : "");
+  const [deadline, setDeadline] = useState(fromCoach?.deadline ?? "");
+  const [terms, setTerms] = useState<Terms>(
+    fromCoach
+      ? {
+          frequency: fromCoach.frequency,
+          penalty_type: fromCoach.frequency === "none" ? "none" : fromCoach.penalty_type,
+          penalty_percent: fromCoach.penalty_percent,
+          penalty_dare: fromCoach.penalty_dare,
+          pace: fromCoach.pace,
+          realism_score: fromCoach.realism_score,
+          realism_note: fromCoach.realism_note,
+          coach_summary: fromCoach.summary,
+        }
+      : NO_TERMS,
+  );
   const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
   return (
     <section className="panel">
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onCreate({ title: title.trim(), target_amount: Number(target), deadline });
+          onCreate({ title: title.trim(), target_amount: Number(target), deadline, ...terms, penalty_type: terms.frequency === "none" ? "none" : terms.penalty_type });
         }}
       >
-        <p className="panel-title">New shared goal</p>
-        <p className="panel-subtitle">Everyone in the group can commit a share once it's created.</p>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <p className="panel-title">New shared goal</p>
+            <p className="panel-subtitle">{fromCoach ? "Filled in by Gemini from your chat. Change anything before you create it." : "Everyone in the group can commit a share once it's created."}</p>
+          </div>
+          <button className="text-[11px] font-bold text-[#FF8A5B] hover:underline" onClick={onBackToCoach} type="button">
+            {fromCoach ? "← Back to the coach" : "✦ Plan it with Gemini instead"}
+          </button>
+        </div>
+
+        {fromCoach && (
+          <div className="mt-4 rounded-xl bg-[#F4F5FB] p-3.5">
+            <Realism note={fromCoach.realism_note} score={fromCoach.realism_score} />
+          </div>
+        )}
+
         <div className="mt-4 grid gap-4 sm:grid-cols-[1.4fr_1fr_1fr]">
           <label className="block">
             <span className={fieldLabel}>What are you saving for?</span>
@@ -543,6 +637,12 @@ function NewGoalForm({ busy, onCreate, onCancel }: { busy: boolean; onCreate: (b
             <input className={input} min={tomorrow} onChange={(e) => setDeadline(e.target.value)} required type="date" value={deadline} />
           </label>
         </div>
+
+        <div className="mt-5 border-t border-[#DADDF1] pt-4">
+          <p className="mb-3 text-xs font-bold">The rules</p>
+          <TermsFields onChange={setTerms} terms={terms} />
+        </div>
+
         <div className="mt-5 flex gap-2">
           <button className={primaryBtn} disabled={busy} type="submit">
             Create goal
@@ -578,8 +678,15 @@ function GoalCard({
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [editingTerms, setEditingTerms] = useState(false);
+  const [terms, setTerms] = useState<Terms>(goal.terms);
 
   const committed = goal.my_share !== null;
+  const mine = goal.members.find((m) => m.person.id === meId)?.schedule ?? null;
+  // The goal's on-chain vault (Solana); reloads whenever the amount saved changes.
+  const vault = useVault(goal.id, `${goal.total_saved}-${contributions.length}`);
+  const hasSchedule = goal.terms.frequency !== "none";
+  const every = goal.terms.frequency === "weekly" ? "week" : goal.terms.frequency === "biweekly" ? "2 weeks" : "month";
   const expectedPct = goal.target ? (100 * goal.expected_by_now) / goal.target : 0;
   const memberCount = goal.members.length;
   const committedCount = memberCount - goal.uncommitted_count;
@@ -618,6 +725,69 @@ function GoalCard({
         )}
       </div>
 
+      {/* The rules: payment schedule + missed-payment penalty */}
+      <div className="mt-4 rounded-xl border border-[#DADDF1] bg-[#FFFDF7] px-3.5 py-3">
+        {editingTerms ? (
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const body = { ...terms, penalty_type: terms.frequency === "none" ? "none" : terms.penalty_type };
+              if (await run(() => api("PUT", `/api/goals/${goal.id}/terms`, body), `Updated the rules for ${goal.title}.`)) setEditingTerms(false);
+            }}
+          >
+            <TermsFields onChange={setTerms} terms={terms} />
+            <div className="mt-3 flex gap-2">
+              <button className={primaryBtn} disabled={busy} type="submit">
+                Save rules
+              </button>
+              <button className={secondaryBtn} onClick={() => setEditingTerms(false)} type="button">
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-[11px] text-[#275992]">
+              {hasSchedule ? (
+                <>
+                  <strong>Pay every {every}</strong> · {describePenalty(goal.terms)}
+                  {goal.terms.realism_score !== null && <span className="text-[#8790AE]"> · Gemini rated it {goal.terms.realism_score}/10</span>}
+                </>
+              ) : (
+                <span className="text-[#6F789A]">No payment schedule or penalty yet.</span>
+              )}
+            </div>
+            {canDelete && (
+              <button
+                className="text-[11px] font-bold text-[#FF8A5B] hover:underline"
+                onClick={() => {
+                  setTerms(goal.terms);
+                  setEditingTerms(true);
+                }}
+                type="button"
+              >
+                {hasSchedule ? "Edit rules" : "Set rules"}
+              </button>
+            )}
+          </div>
+        )}
+        {mine && committed && !editingTerms && (
+          <p className="mt-2 border-t border-[#DADDF1] pt-2 text-[11px] text-[#6F789A]">
+            {mine.next_due ? (
+              <>
+                Your next payment: <strong className="text-[#275992]">{money(mine.next_amount)}</strong> by {longDate(mine.next_due)}
+              </>
+            ) : (
+              "All your payments are due."
+            )}
+            {mine.penalty_owed > 0 && <span className="font-semibold text-[#b4502f]"> · includes {money(mine.penalty_owed)} for missed payments</span>}
+            {mine.dares_owed > 0 && <span className="font-semibold text-[#b4502f]"> · you owe the group {mine.dares_owed === 1 ? "a dare" : `${mine.dares_owed} dares`}</span>}
+          </p>
+        )}
+      </div>
+
+      <VaultPanel vault={vault} />
+
       {/* Per-member accountability */}
       <div className="mt-5 space-y-3 border-t border-[#DADDF1] pt-4">
         {goal.members.map((m) => (
@@ -638,8 +808,16 @@ function GoalCard({
                     tone={m.status === "behind" ? "orange" : m.status === "complete" ? "purple" : "green"}
                   />
                   <p className="mt-1 text-[10px] text-[#8790AE]">
-                    {money(m.saved)} of {money(m.share)} · should be at {money(m.expected_by_now)}
+                    {money(m.saved)} of {money(m.schedule ? m.schedule.total_owed : m.share)} · should be at {money(m.expected_by_now)}
+                    {m.schedule && ` · ${m.schedule.payments_due_so_far} of ${m.schedule.payments_total} payments due`}
                   </p>
+                  {m.schedule && m.schedule.missed > 0 && (
+                    <p className="mt-1 inline-block rounded-md bg-[#fff0e9] px-2 py-0.5 text-[10px] font-bold text-[#b4502f]">
+                      Missed {m.schedule.missed} payment{m.schedule.missed === 1 ? "" : "s"}
+                      {m.schedule.penalty_owed > 0 && ` · +${money(m.schedule.penalty_owed)} penalty`}
+                      {m.schedule.dares_owed > 0 && ` · owes ${m.schedule.dares_owed === 1 ? "a dare" : `${m.schedule.dares_owed} dares`}: ${goal.terms.penalty_dare}`}
+                    </p>
+                  )}
                 </>
               ) : (
                 <p className="text-[10px] text-[#8790AE]">Hasn't committed a share yet{m.saved > 0 ? ` (saved ${money(m.saved)})` : ""}</p>
@@ -743,6 +921,7 @@ function GoalCard({
               <div className="flex items-center justify-between py-1 text-[11px]" key={c.id}>
                 <span>
                   <strong>{money(c.amount)}</strong> <span className="text-[#8790AE]">{c.note && `· ${c.note} `}· {when(c.created_at)}</span>
+                  <ChainBadge entry={vault?.by_contribution?.[String(c.id)]} />
                 </span>
                 <button className={quietBtn} disabled={busy} onClick={() => run(() => api("DELETE", `/api/contributions/${c.id}`), `Took back ${money(c.amount)}. It's back in your bank balance.`)}>
                   Undo

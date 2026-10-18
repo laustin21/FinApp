@@ -102,7 +102,7 @@ def unlink(user: dict = Depends(current_user)):
 # Spending styles a new user can pick. Each borrows a demo persona's habits.
 STYLES = {"student": "maya", "commuter": "carlos", "professional": "priya"}
 NEW_HISTORY_DAYS = 60
-MERCHANTS_FILE = Path(__file__).with_name("merchants.json")
+MERCHANTS_FILE = db.DATA_DIR / "merchants.json"
 _merchant_lock = threading.Lock()
 _building: dict[int, str] = {}   # user_id -> "building" | "done" | "failed"
 _progress: dict[int, dict] = {}  # user_id -> {"done": n, "total": n} transactions written so far

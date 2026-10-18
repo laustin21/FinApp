@@ -6,6 +6,7 @@ import Groups from "./Groups";
 import Transactions, { statementPath } from "./Transactions";
 import AccountsPage, { LinkBankForm } from "./LinkBank";
 import { SignInLoading } from "./Loading";
+import { AiStatusBadge, GeminiThinking } from "./AiStatus";
 
 type Customer = { id: string; first_name: string; last_name: string };
 type CategoryTotal = { name: string; amount: number; count: number; percent: number };
@@ -423,6 +424,7 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
           </span>
         </div>
         <div className="flex items-center gap-2 sm:gap-4">
+          <AiStatusBadge />
           <NotificationBell onOpenTarget={setActiveNav} />
           <div className="mx-1 hidden h-7 w-px bg-[#DADDF1] sm:block" />
           <div className="flex items-center gap-2 rounded-full p-1 pr-2">
@@ -815,10 +817,7 @@ function AiInsightsPanel({ ai, loading, onRefresh }: { ai: InsightsResponse | nu
           </div>
         </div>
         {loading && !ai && (
-          <div className="space-y-2">
-            <div className="h-3 w-3/4 animate-pulse rounded bg-white/60" />
-            <div className="h-3 w-2/3 animate-pulse rounded bg-white/60" />
-          </div>
+          <GeminiThinking steps={["Reading your transactions", "Totaling spending by category", "Comparing with last period", "Writing your insights"]} />
         )}
         {ai && !ai.available && !loading && <p className="text-xs text-[#6F789A]">{ai.reason}</p>}
         {ai?.available && ai.insights && (
