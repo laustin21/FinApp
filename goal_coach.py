@@ -16,7 +16,8 @@ How it works
   user's spare cash) and keeps the realism score honest. The frontend uses the plan
   to fill in the new-goal form, where the user reviews it and creates the goal.
 """
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -166,6 +167,106 @@ def plan_math(plan: dict, members: int, picture: dict | None, today: date) -> di
     return out
 
 
+# ---------- Backup coach (no Gemini needed) ----------
+# Used when Gemini is slow or unavailable, so the chat never hangs in a demo. It reads
+# everything the user has said so far, asks for the first missing piece, and builds
+# the same kind of plan once it has them all.
+
+COACH_BUDGET_SECONDS = 15
+MONTHS = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+
+
+def _find_amount(texts: list[str]) -> float | None:
+    for t in texts:
+        if re.search(MONTHS, t, re.I) and "$" not in t:
+            continue  # "Jan 15, 2027" is a date, not money
+        m = re.search(r"\$?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?\b", t, re.I)
+        if m and ("$" in t or m.group(2) or len(t.strip()) <= 12):
+            value = float(m.group(1).replace(",", "")) * (1000 if m.group(2) else 1)
+            if value >= 1:
+                return value
+    return None
+
+
+def _find_date(texts: list[str], today: date) -> date | None:
+    for t in texts:
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                d = datetime.strptime(t.strip(), fmt).date()
+                if d > today:
+                    return d
+            except ValueError:
+                pass
+        m = re.search(r"(\d+)\s*(week|month|year)", t, re.I)
+        if m and re.search(r"\b(in|within|next|about)\b|^\s*\d", t, re.I):
+            n, unit = int(m.group(1)), m.group(2).lower()
+            return today + timedelta(days=n * {"week": 7, "month": 30, "year": 365}[unit])
+    return None
+
+
+def _find_frequency(texts: list[str]) -> str | None:
+    for t in texts:
+        low = t.lower()
+        if "2 week" in low or "two week" in low or "biweekly" in low or "bi-weekly" in low:
+            return "biweekly"
+        if "week" in low:
+            return "weekly"
+        if "month" in low and not re.search(r"\d+\s*month", low):
+            return "monthly"
+    return None
+
+
+def _find_penalty(texts: list[str]) -> tuple[str, float, str] | None:
+    for t in texts:
+        low = t.lower()
+        if "no penalty" in low or low.strip() in ("none", "nothing", "no"):
+            return "none", 0, ""
+        if "dare" in low or "honor" in low:
+            return "honor", 0, "Buy the group's next round of coffee"
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%", t)
+        if m or "extra" in low or "money" in low:
+            return "money", float(m.group(1)) if m else 10.0, ""
+    return None
+
+
+def backup_turn(messages: list[ChatMessage], members: int, picture: dict | None, today: date) -> dict:
+    said = [m.text.strip() for m in messages if m.role == "user" and m.text.strip()]
+    title = (said[0] if said else "Group goal")[:60]
+    later = said[1:]
+    amount, deadline = _find_amount(later), _find_date(later, today)
+    frequency, penalty = _find_frequency(later), _find_penalty(later)
+    plan = {"title": title.capitalize() if title.islower() else title, "target_amount": amount or 0,
+            "deadline": deadline.isoformat() if deadline else "", "frequency": frequency or "none", "pace": "Steady",
+            "penalty_type": penalty[0] if penalty else "none", "penalty_percent": penalty[1] if penalty else 0,
+            "penalty_dare": penalty[2] if penalty else "", "realism_score": 7, "realism_note": "", "summary": ""}
+    turn = {"ready": False, "plan": plan, "chips": []}
+    if not said:
+        turn["reply"], turn["chips"] = "What are you saving for?", ["A group trip", "Concert tickets", "A shared dinner fund"]
+    elif amount is None:
+        turn["reply"] = f"Nice: {plan['title']}. How much does the whole group need?"
+        turn["chips"] = ["$500", "$1,000", "$2,500", "$5,000"]
+    elif deadline is None:
+        turn["reply"] = f"Got it, ${amount:,.0f}. When should the group hit it?"
+        turn["chips"] = [(today + timedelta(days=d)).strftime("%b %d, %Y") for d in (30, 90, 180)]
+    elif frequency is None:
+        turn["reply"] = "How often should everyone chip in?"
+        turn["chips"] = ["Weekly", "Every 2 weeks", "Monthly"]
+    elif penalty is None:
+        turn["reply"] = "What happens if someone misses a payment?"
+        turn["chips"] = ["Pay 10% extra", "Honor-code dare", "No penalty"]
+    else:
+        turn["ready"] = True
+        math = plan_math(plan, members, picture, today) or {}
+        per = {"weekly": "week", "biweekly": "2 weeks", "monthly": "month"}[frequency]
+        plan["realism_score"] = min(8, math.get("realism_cap", 8))
+        plan["realism_note"] = (f"About ${math.get('monthly_per_person', 0):,.0f} a month each"
+                                + (f", {math['share_of_spare_cash_pct']}% of your spare cash." if math.get("share_of_spare_cash_pct") is not None else "."))
+        plan["summary"] = f"${amount:,.0f} by {deadline:%b %d, %Y}, paid every {per}."
+        turn["reply"] = "Here's a plan based on your answers. Review it, then use it to fill in the goal."
+        turn["chips"] = ["Use this plan", "Make it cheaper"]
+    return turn
+
+
 def _transcript(messages: list[ChatMessage]) -> str:
     if not messages:
         return "(The user just opened the coach. Greet them in one short sentence and ask your first question.)"
@@ -175,8 +276,6 @@ def _transcript(messages: list[ChatMessage]) -> str:
 @router.post("/groups/{group_id}/goal-coach")
 def goal_coach(group_id: int, body: CoachIn, user: dict = Depends(current_user)):
     facts = _group_facts(group_id, user)
-    if not gemini.available():
-        return {"available": False, "reason": "Add GEMINI_API_KEY to turn on the goal coach. You can still fill in the goal yourself."}
     today = date.today()
     picture = money_picture(user)
     context = {
@@ -186,11 +285,15 @@ def goal_coach(group_id: int, body: CoachIn, user: dict = Depends(current_user))
         "user_money_picture": picture or "No bank linked, so you can't judge affordability. Say so if it matters.",
     }
     prompt = f"Context (JSON):\n{context}\n\nConversation so far:\n{_transcript(body.messages)}\n\nYour next turn:"
+    source = "gemini"
     try:
-        turn = gemini.generate_json(SYSTEM, prompt, CoachTurn, tier="smart")
+        if not gemini.available():
+            raise RuntimeError("no GEMINI_API_KEY")
+        turn = gemini.generate_json_within(COACH_BUDGET_SECONDS, SYSTEM, prompt, CoachTurn, tier="coach")
     except Exception as e:
-        print(f"Goal coach failed: {e}")
-        raise HTTPException(502, "The goal coach couldn't reach Gemini. Try again, or fill in the goal yourself.")
+        # Too slow or failed: answer with the backup coach so the chat keeps moving.
+        print(f"Goal coach used its backup ({e.__class__.__name__}: {str(e)[:120]})")
+        turn, source = backup_turn(body.messages, facts["members"], picture, today), "backup"
 
     plan = turn["plan"]
     math = plan_math(plan, facts["members"], picture, today) if turn["ready"] else None
@@ -204,4 +307,5 @@ def goal_coach(group_id: int, body: CoachIn, user: dict = Depends(current_user))
         if plan["realism_score"] > math["realism_cap"]:
             plan["realism_score"] = math["realism_cap"]
         plan["realism_score"] = max(1, min(10, int(plan["realism_score"] or math["realism_cap"])))
-    return {"available": True, "reply": turn["reply"], "chips": turn["chips"][:4], "ready": turn["ready"], "plan": plan, "math": math}
+    return {"available": True, "reply": turn["reply"], "chips": turn["chips"][:4], "ready": turn["ready"], "plan": plan, "math": math,
+            "source": source}

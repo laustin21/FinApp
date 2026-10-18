@@ -138,7 +138,7 @@ export type CoachMath = {
   share_of_spare_cash_pct: number | null;
   realism_label: string | null;
 };
-type CoachReply = { available: boolean; reason?: string; reply: string; chips: string[]; ready: boolean; plan: CoachPlan; math: CoachMath | null };
+type CoachReply = { available: boolean; reason?: string; reply: string; chips: string[]; ready: boolean; plan: CoachPlan; math: CoachMath | null; source?: "gemini" | "backup" };
 type Line = { role: "user" | "coach"; text: string };
 
 export function GoalCoach({ groupId, onUsePlan, onSkip }: { groupId: number; onUsePlan: (plan: CoachPlan) => void; onSkip: () => void }) {
@@ -148,6 +148,7 @@ export function GoalCoach({ groupId, onUsePlan, onSkip }: { groupId: number; onU
   const [thinking, setThinking] = useState(false);
   const [error, setError] = useState("");
   const [unavailable, setUnavailable] = useState("");
+  const [quick, setQuick] = useState(false); // the backup planner answered because Gemini was slow
   const [result, setResult] = useState<{ plan: CoachPlan; math: CoachMath } | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -165,6 +166,7 @@ export function GoalCoach({ groupId, onUsePlan, onSkip }: { groupId: number; onU
       setLines([...history, { role: "coach", text: r.reply }]);
       setChips(r.chips);
       setResult(r.ready && r.math ? { plan: r.plan, math: r.math } : null);
+      setQuick(r.source === "backup");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -249,6 +251,9 @@ export function GoalCoach({ groupId, onUsePlan, onSkip }: { groupId: number; onU
               <div ref={bottom} />
             </div>
 
+            {quick && !thinking && (
+              <p className="mt-2 text-[10px] text-[#6F789A]">Gemini was slow to answer, so Gatorstar's quick planner replied. Keep going, nothing is lost.</p>
+            )}
             {error && <p className="mt-3 rounded-lg bg-[#fff4f0] px-3 py-2 text-[11px] font-semibold text-[#9a3b22]">{error}</p>}
 
             {chips.length > 0 && !thinking && (

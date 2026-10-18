@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useLive } from "./live";
 import { api as call } from "./api";
 
 type Person = { id: number; username: string; display_name: string };
@@ -63,6 +64,8 @@ export default function Friends({ myUsername }: { myUsername: string }) {
   useEffect(() => {
     load();
   }, [load]);
+  // Someone sent / accepted / removed a friend request: update without a refresh.
+  useLive(["friends"], load);
 
   async function act(key: string, run: () => Promise<unknown>, success: string | ((result: any) => string)) {
     setBusy(key);

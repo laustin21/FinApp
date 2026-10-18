@@ -228,9 +228,23 @@ def _add_missing_columns(conn):
         ("realism_score", "INTEGER"),                       # 1-10, from the coach
         ("realism_note", "TEXT"),
         ("coach_summary", "TEXT"),
+        ("completed_at", "TEXT"),                           # when the group first hit the target
+        ("released_at", "TEXT"),                            # escrow: when the pot was paid out
+        ("released_cents", "INTEGER"),
+        ("released_to", "INTEGER"),                         # user who received the payout
+        ("public_token", "TEXT"),                           # share link for the public proof page
     ):
         if column not in have:
             conn.execute(f"ALTER TABLE goals ADD COLUMN {column} {kind}")
+
+
+def _add_tables(conn):
+    # Who has already seen the "goal reached" celebration (each member sees it once).
+    conn.execute("""CREATE TABLE IF NOT EXISTS goal_celebrations (
+        goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (goal_id, user_id))""")
 
 
 def init():
@@ -240,6 +254,7 @@ def init():
             _migrate_email_to_username(conn)
         conn.executescript(SCHEMA)
         _add_missing_columns(conn)
+        _add_tables(conn)
 
 
 def now():

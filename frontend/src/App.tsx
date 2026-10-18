@@ -7,6 +7,10 @@ import Transactions, { statementPath } from "./Transactions";
 import AccountsPage, { LinkBankForm } from "./LinkBank";
 import { SignInLoading } from "./Loading";
 import { AiStatusBadge, GeminiThinking } from "./AiStatus";
+import { useLive } from "./live";
+import { GoalCelebrations } from "./Celebration";
+import { ProofPage } from "./Proof";
+import { Logo } from "./Logo";
 
 type Customer = { id: string; first_name: string; last_name: string };
 type CategoryTotal = { name: string; amount: number; count: number; percent: number };
@@ -349,6 +353,10 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
     }, 10000);
     return () => clearInterval(timer);
   }, [period, linked, me.bank_link?.nessie_customer_id]);
+  // Money moved (a goal contribution, a simulated purchase...): refresh the numbers.
+  useLive(["money"], () => {
+    if (linked) api<Dashboard>("GET", `/api/me/dashboard?period=${period}`).then(setData).catch(() => {});
+  });
 
   // Gemini insights: once per period (the server caches answers for the same numbers).
   const loadInsights = useCallback(() => {
@@ -411,13 +419,11 @@ function Shell({ me, onLogout, onMeChanged }: { me: Me; onLogout: () => void; on
 
   return (
     <div className="min-h-screen bg-[#FFFAED] text-[#275992]">
+      {/* Confetti when a group goal is reached (shown once per member, anywhere in the app). */}
+      <GoalCelebrations onViewGroups={() => setActiveNav("Groups")} />
       <header className="sticky top-0 z-30 flex h-[72px] items-center justify-between border-b border-[#DADDF1] bg-[#FFFDF7] px-5 lg:px-8">
         <div className="flex items-center gap-3">
-          <div className="grid size-9 place-items-center rounded-[12px] bg-[#95A1D8] text-white">
-            <svg aria-hidden="true" height="21" viewBox="0 0 24 24" width="21">
-              <path d="M4 18V9l8-5 8 5v9l-8-4.6L4 18Z" fill="currentColor" />
-            </svg>
-          </div>
+          <Logo size={40} />
           <span className="text-[19px] font-bold tracking-[-0.04em]">Gatorstar</span>
           <span className="hidden rounded-full bg-[#E2E5F4] px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-[#6F789A] sm:block">
             Banking
@@ -718,9 +724,11 @@ function NotificationBell({ onOpenTarget }: { onOpenTarget: (target: string) => 
     load();
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") load();
-    }, 15000);
+    }, 30000);
     return () => clearInterval(timer);
   }, [load]);
+  // Friend requests, invites and group activity appear in the bell within ~2 s.
+  useLive(["friends", "groups"], load);
 
   // Close when clicking outside the panel.
   useEffect(() => {
@@ -845,4 +853,10 @@ function AiInsightsPanel({ ai, loading, onRefresh }: { ai: InsightsResponse | nu
   );
 }
 
-export default App;
+// A shared proof link (/?proof=<token>) opens the public vault page, no login needed.
+function Root() {
+  const proof = new URLSearchParams(window.location.search).get("proof");
+  return proof ? <ProofPage token={proof} /> : <App />;
+}
+
+export default Root;

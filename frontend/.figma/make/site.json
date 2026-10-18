@@ -1,10 +1,14 @@
 {
-  "description": "This banking application provides users with detailed purchase history reports and offers discounts on their most purchased categories, enhancing savings.",
+  "title": "Gatorstar",
+  "description": "Gatorstar: group savings goals with a Gemini coach and a verifiable Solana vault.",
   "robots": {
     "index": false
   },
   "accessibility": {
     "addBypassLinks": false,
     "ignoreReducedMotion": false
+  },
+  "icons": {
+    "icon": "/favicon-64.png"
   }
 }

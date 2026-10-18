@@ -35,7 +35,13 @@ TIERS = {
              "thinking": os.getenv("GEMINI_THINKING_FAST", os.getenv("GEMINI_THINKING", "minimal"))},
     "smart": {"model": os.getenv("GEMINI_MODEL_SMART", MODEL),
               "thinking": os.getenv("GEMINI_THINKING_SMART", "low")},
+    # The goal coach is a live chat, so it uses the quick model: fast answers matter more there.
+    "coach": {"model": os.getenv("GEMINI_MODEL_COACH", os.getenv("GEMINI_MODEL_FAST", "gemini-flash-lite-latest")),
+              "thinking": os.getenv("GEMINI_THINKING_COACH", "minimal")},
 }
+# If a tier's model isn't available to this key, try these next (Google's auto-updating names).
+FALLBACK_MODELS = [MODEL, "gemini-flash-lite-latest", "gemini-flash-latest"]
+_bad_models: set[str] = set()
 CACHE_SECONDS = 15 * 60          # reuse an answer for the same numbers for 15 minutes
 
 RULES = (
@@ -163,6 +169,16 @@ def _cached(key: str) -> dict | None:
     return hit[1] if hit and time.time() - hit[0] < CACHE_SECONDS else None
 
 
+def _next_model(current: str) -> str | None:
+    return next((m for m in FALLBACK_MODELS if m != current and m not in _bad_models), None)
+
+
+def generate_json_within(seconds: float, system: str, prompt: str, schema: type[BaseModel], tier: str = "fast") -> dict:
+    """generate_json, but give up after `seconds` (raises TimeoutError). The call itself
+    keeps running in the background and still updates the status badge."""
+    return _pool.submit(generate_json, system, prompt, schema, tier).result(timeout=seconds)
+
+
 def _is_missing_model(text: str) -> bool:
     return any(t in text for t in ("not found", "404", "not supported", "permission", "403", "is not available"))
 
@@ -194,10 +210,12 @@ def generate_json(system: str, prompt: str, schema: type[BaseModel], tier: str =
             if "think" in text and model not in _no_thinking:
                 print(f"Gemini model {model} rejected thinking level {cfg['thinking']}; retrying without it.")
                 _no_thinking.add(model)
-            elif model != MODEL and _is_missing_model(text):
-                # This key can't use the tier's model: fall back to the base model from now on.
-                print(f"Gemini model {model} isn't available ({str(e)[:80]}); using {MODEL} for {tier} requests.")
-                cfg["model"] = model = MODEL
+            elif _is_missing_model(text) and _next_model(model):
+                # This key can't use the tier's model: switch to the next one from now on.
+                _bad_models.add(model)
+                nxt = _next_model(model)
+                print(f"Gemini model {model} isn't available ({str(e)[:80]}); using {nxt} for {tier} requests.")
+                cfg["model"] = model = nxt
             elif any(t in text for t in ("503", "unavailable", "500", "internal", "timed out", "timeout")):
                 time.sleep(0.8)  # brief hiccup on Google's side: one quick retry
             else:

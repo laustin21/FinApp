@@ -78,6 +78,7 @@ import friends
 import gemini
 import goal_coach
 import groups
+import live
 import nessie
 import notifications
 import simulate
@@ -119,6 +120,9 @@ app.include_router(bank.router)
 app.include_router(friends.router)
 app.include_router(groups.router)
 app.include_router(goal_coach.router)
+app.include_router(live.router)
+# Live updates: note every change so open apps refresh themselves (see live.py).
+app.middleware("http")(live.middleware)
 app.include_router(statement.router)
 app.include_router(simulate.router)
 app.include_router(notifications.router)

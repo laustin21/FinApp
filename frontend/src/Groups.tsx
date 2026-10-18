@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
+import { useLive } from "./live";
 import { initials } from "./Friends";
-import { ChainBadge, VaultPanel, useVault } from "./Vault";
+import { ChainBadge, ChainTracker, EscrowStrip, VaultPanel, useVault, type Escrow } from "./Vault";
 import { GoalCoach, NO_TERMS, Realism, TermsFields, describePenalty, type CoachPlan, type Terms } from "./GoalCoach";
 
 // ---------- Types (match groups.py) ----------
@@ -37,6 +38,7 @@ type Goal = {
   suggested_share: number;
   members: MemberProgress[];
   terms: Terms;
+  escrow: Escrow;
 };
 type GroupSummary = {
   id: number;
@@ -175,6 +177,8 @@ function GroupList({ onOpen }: { onOpen: (id: number) => void }) {
   }, []);
   const { busy, message, setMessage, run } = useAction(load);
   useEffect(load, [load]);
+  // New groups, invites and goal progress from other people show up on their own.
+  useLive(["groups", "friends"], load);
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -354,9 +358,11 @@ function GroupView({ groupId, meId, onBack }: { groupId: number; meId: number; o
     // Live: pick up friends' savings and balance changes without a refresh.
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") load();
-    }, 8000);
+    }, 20000); // safety net; live updates (below) normally refresh within ~2 s
     return () => clearInterval(timer);
   }, [load]);
+  // Another member added a goal, saved money, changed the rules...: show it right away.
+  useLive(["groups"], load);
 
   if (!g)
     return (
@@ -680,6 +686,8 @@ function GoalCard({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [editingTerms, setEditingTerms] = useState(false);
   const [terms, setTerms] = useState<Terms>(goal.terms);
+  const [tracking, setTracking] = useState<number | null>(null); // contribution shown in the live Solana tracker
+  const released = goal.escrow?.state === "released";
 
   const committed = goal.my_share !== null;
   const mine = goal.members.find((m) => m.person.id === meId)?.schedule ?? null;
@@ -786,7 +794,21 @@ function GoalCard({
         )}
       </div>
 
-      <VaultPanel vault={vault} />
+      {goal.escrow && (
+        <div className="mt-4">
+          <EscrowStrip
+            busy={busy}
+            escrow={goal.escrow}
+            onRelease={() =>
+              run(
+                () => api("POST", `/api/goals/${goal.id}/release`),
+                (r: { released: number; to_account: string }) => `Released ${money(r.released)} from the ${goal.title} vault into your ${r.to_account}. The payout is being recorded on Solana.`,
+              )
+            }
+          />
+        </div>
+      )}
+      <VaultPanel goalId={goal.id} vault={vault} />
 
       {/* Per-member accountability */}
       <div className="mt-5 space-y-3 border-t border-[#DADDF1] pt-4">
@@ -833,7 +855,11 @@ function GoalCard({
 
       {/* Your actions */}
       <div className="mt-5 rounded-2xl bg-[#F4F5FB] p-4">
-        {!committed || editingShare ? (
+        {released ? (
+          <p className="text-[11px] text-[#6F789A]">
+            <strong className="text-[#275992]">This goal is finished and paid out.</strong> The vault is closed, so no more money can go in or come back out.
+          </p>
+        ) : !committed || editingShare ? (
           <form
             className="flex flex-wrap items-end gap-3"
             onSubmit={async (e) => {
@@ -870,7 +896,11 @@ function GoalCard({
             onSubmit={async (e) => {
               e.preventDefault();
               const ok = await run(
-                () => api("POST", `/api/goals/${goal.id}/contributions`, { amount: Number(amount), note }),
+                () =>
+                  api<{ id: number }>("POST", `/api/goals/${goal.id}/contributions`, { amount: Number(amount), note }).then((r) => {
+                    setTracking(r.id);
+                    return r;
+                  }),
                 (r: { from_account: string; new_balance: number }) =>
                   `Moved ${money(Number(amount))} from ${r.from_account} into ${goal.title}. ${r.from_account} balance is now ${money(r.new_balance)}.`,
               );
@@ -914,6 +944,8 @@ function GoalCard({
           </form>
         )}
 
+        {tracking !== null && <ChainTracker contributionId={tracking} key={tracking} onClose={() => setTracking(null)} />}
+
         {contributions.length > 0 && (
           <div className="mt-4 border-t border-[#DADDF1] pt-3">
             <p className={fieldLabel}>Your recent entries</p>
@@ -922,8 +954,13 @@ function GoalCard({
                 <span>
                   <strong>{money(c.amount)}</strong> <span className="text-[#8790AE]">{c.note && `· ${c.note} `}· {when(c.created_at)}</span>
                   <ChainBadge entry={vault?.by_contribution?.[String(c.id)]} />
+                  {vault?.enabled && (
+                    <button className="ml-1.5 text-[9px] font-bold text-[#8790AE] hover:text-[#275992] hover:underline" onClick={() => setTracking(c.id)} type="button">
+                      track
+                    </button>
+                  )}
                 </span>
-                <button className={quietBtn} disabled={busy} onClick={() => run(() => api("DELETE", `/api/contributions/${c.id}`), `Took back ${money(c.amount)}. It's back in your bank balance.`)}>
+                <button className={quietBtn} disabled={busy || released} onClick={() => run(() => api("DELETE", `/api/contributions/${c.id}`), `Took back ${money(c.amount)}. It's back in your bank balance.`)}>
                   Undo
                 </button>
               </div>

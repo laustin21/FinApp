@@ -31,6 +31,7 @@ Goal terms (optional, set by hand or filled in by the Gemini goal coach, goal_co
     they owe the group the agreed dare (enforced by the friend group, shown here).
 """
 import math
+import secrets
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -104,6 +105,61 @@ def _time_elapsed_fraction(created_at: str, deadline: str, today: date) -> float
     if end <= start:
         return 1.0
     return min(1.0, max(0.0, (today - start).days / (end - start).days))
+
+
+def mark_complete_if_reached(conn, goal) -> bool:
+    """The first time a goal's savings reach its target: record it and tell the whole
+    group (the activity entry has no author, so every member is notified, including
+    whoever made the last contribution). Returns True if it just completed."""
+    if "completed_at" in goal.keys() and goal["completed_at"]:
+        return False
+    saved = conn.execute("SELECT COALESCE(SUM(amount_cents), 0) AS c FROM contributions WHERE goal_id = ?",
+                         (goal["id"],)).fetchone()["c"]
+    if saved < goal["target_cents"]:
+        return False
+    conn.execute("UPDATE goals SET completed_at = ? WHERE id = ? AND completed_at IS NULL", (db.now(), goal["id"]))
+    _log(conn, goal["group_id"], None, "goal_complete",
+         f"🎉 Goal reached! “{goal['title']}” hit ${dollars(goal['target_cents']):,.2f}. Nice work, team!")
+    return True
+
+
+def _can_manage(conn, goal, user_id) -> bool:
+    owner = conn.execute("SELECT owner_id FROM groups WHERE id = ?", (goal["group_id"],)).fetchone()["owner_id"]
+    return user_id in (goal["created_by"], owner)
+
+
+def escrow_state(conn, goal, viewer_id: int | None, total_saved: int | None = None) -> dict:
+    """The vault works like escrow: money is LOCKED until the goal is reached, then the
+    goal's creator (or group owner) can RELEASE the whole pot in one payout.
+      locked     -> still saving; nobody can take the pot
+      releasable -> target reached; waiting for the creator to release
+      released   -> paid out (on Solana: vault -> creator, then burned)"""
+    if total_saved is None:
+        total_saved = conn.execute("SELECT COALESCE(SUM(amount_cents), 0) AS c FROM contributions WHERE goal_id = ?",
+                                   (goal["id"],)).fetchone()["c"]
+    keys = goal.keys()
+    released_at = goal["released_at"] if "released_at" in keys else None
+    if released_at:
+        state = "released"
+    elif total_saved >= goal["target_cents"]:
+        state = "releasable"
+    else:
+        state = "locked"
+    to = goal["released_to"] if "released_to" in keys else None
+    return {
+        "state": state,
+        "released_at": released_at,
+        "released_cents": (goal["released_cents"] or 0) if "released_cents" in keys else 0,
+        "released_amount": dollars((goal["released_cents"] or 0) if "released_cents" in keys else 0),
+        "released_to": _name(conn, to) if to else None,
+        "can_release": state == "releasable" and viewer_id is not None and _can_manage(conn, goal, viewer_id),
+        "pot": dollars(total_saved),
+    }
+
+
+def _not_released(goal):
+    if "released_at" in goal.keys() and goal["released_at"]:
+        raise HTTPException(409, "This goal's vault has already been released, so its savings can't change")
 
 
 FREQUENCIES = ("none", "weekly", "biweekly", "monthly")
@@ -248,6 +304,8 @@ def goal_progress(conn, goal, viewer_id: int, today: date | None = None) -> dict
         "target": dollars(target),
         "deadline": goal["deadline"],
         "created_at": goal["created_at"],
+        "completed_at": goal["completed_at"] if "completed_at" in goal.keys() else None,
+        "escrow": escrow_state(conn, goal, viewer_id, total_saved),
         "created_by": goal["created_by"],
         "days_left": days_left,
         "total_saved": dollars(total_saved),
@@ -602,10 +660,25 @@ def delete_goal(goal_id: int, user: dict = Depends(current_user)):
         owner = conn.execute("SELECT owner_id FROM groups WHERE id = ?", (goal["group_id"],)).fetchone()["owner_id"]
         if user["id"] not in (goal["created_by"], owner):
             raise HTTPException(403, "Only the person who created this goal, or the group owner, can delete it")
+        released = bool(goal["released_at"])
+        money = [] if released else conn.execute(
+            "SELECT nessie_type, nessie_id FROM contributions WHERE goal_id = ? AND nessie_id IS NOT NULL", (goal_id,)).fetchall()
+    # Escrow: a goal deleted before payout gives everyone their money back, in the bank and on-chain.
+    refunded = 0
+    for c in money:
+        try:
+            banking.remove(c["nessie_type"], c["nessie_id"], reason="goal deleted")
+            refunded += 1
+        except nessie.NessieError:
+            pass
+    with db.connect() as conn:
         conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
-        _log(conn, goal["group_id"], user["id"], "goal_deleted", f"{user['display_name']} deleted the goal “{goal['title']}”")
-    solana_vault.enqueue_goal_refunds(goal_id, goal["title"])
-    return {"status": "deleted"}
+        note = f" Everyone's savings went back to their bank accounts." if refunded else ""
+        _log(conn, goal["group_id"], user["id"], "goal_deleted",
+             f"{user['display_name']} deleted the goal “{goal['title']}”.{note}")
+    if not released:
+        solana_vault.enqueue_goal_refunds(goal_id, goal["title"])
+    return {"status": "deleted", "refunded": refunded}
 
 
 @router.post("/goals/{goal_id}/commit")
@@ -662,6 +735,7 @@ def add_contribution(goal_id: int, body: ContributionIn, user: dict = Depends(cu
     amount = to_cents(body.amount)
     with db.connect() as conn:
         goal = _goal_for_member(conn, goal_id, user["id"])
+        _not_released(goal)
         if not conn.execute(
             "SELECT 1 FROM goal_commitments WHERE goal_id = ? AND user_id = ?", (goal_id, user["id"])
         ).fetchone():
@@ -686,11 +760,53 @@ def add_contribution(goal_id: int, body: ContributionIn, user: dict = Depends(cu
         ).lastrowid
         _log(conn, goal["group_id"], user["id"], "contribution",
              f"{user['display_name']} moved ${dollars(amount):,.2f} into “{goal['title']}”")
+        reached = mark_complete_if_reached(conn, goal)
     # Record it in the goal's on-chain vault (Solana). Queued, so the bank side never waits.
     solana_vault.enqueue_deposit(cid, goal_id, user["id"], amount,
                                  solana_vault.deposit_memo(goal_id, goal["title"], cid, amount, nessie_id))
-    return {"id": cid, "from_account": account["nickname"],
+    return {"id": cid, "goal_reached": reached, "from_account": account["nickname"],
             "new_balance": round(account["balance"] - amount / 100, 2), "nessie_id": nessie_id}
+
+
+# ---------- Goal reached: celebrations ----------
+
+@router.get("/me/celebrations")
+def my_celebrations(user: dict = Depends(current_user)):
+    """Goals in your groups that reached their target and you haven't celebrated yet."""
+    out = []
+    with db.connect() as conn:
+        goals = conn.execute(
+            "SELECT g.*, gr.name AS group_name FROM goals g JOIN groups gr ON gr.id = g.group_id "
+            "JOIN group_members m ON m.group_id = g.group_id AND m.user_id = ?", (user["id"],)).fetchall()
+        for goal in goals:
+            mark_complete_if_reached(conn, goal)   # also catches goals finished before this feature existed
+        rows = conn.execute(
+            "SELECT g.*, gr.name AS group_name FROM goals g JOIN groups gr ON gr.id = g.group_id "
+            "JOIN group_members m ON m.group_id = g.group_id AND m.user_id = ? "
+            "WHERE g.completed_at IS NOT NULL AND g.completed_at >= datetime('now', '-30 days') AND NOT EXISTS "
+            "(SELECT 1 FROM goal_celebrations c WHERE c.goal_id = g.id AND c.user_id = ?) ORDER BY g.completed_at",
+            (user["id"], user["id"])).fetchall()
+        for g in rows:
+            people = conn.execute(
+                "SELECT u.display_name, COALESCE(SUM(c.amount_cents), 0) AS saved FROM contributions c "
+                "JOIN users u ON u.id = c.user_id WHERE c.goal_id = ? GROUP BY u.id ORDER BY saved DESC", (g["id"],)).fetchall()
+            out.append({
+                "goal_id": g["id"], "title": g["title"], "group_id": g["group_id"], "group_name": g["group_name"],
+                "target": dollars(g["target_cents"]), "saved": dollars(sum(p["saved"] for p in people)),
+                "completed_at": g["completed_at"],
+                "contributors": [{"name": p["display_name"], "saved": dollars(p["saved"])} for p in people],
+            })
+    return out
+
+
+@router.post("/goals/{goal_id}/celebrated")
+def mark_celebrated(goal_id: int, user: dict = Depends(current_user)):
+    """You've seen the celebration for this goal (it won't show again)."""
+    with db.connect() as conn:
+        _goal_for_member(conn, goal_id, user["id"])
+        conn.execute("INSERT OR IGNORE INTO goal_celebrations (goal_id, user_id, seen_at) VALUES (?, ?, ?)",
+                     (goal_id, user["id"], db.now()))
+    return {"ok": True}
 
 
 @router.get("/goals/{goal_id}/vault")
@@ -702,7 +818,119 @@ def goal_vault(goal_id: int, user: dict = Depends(current_user)):
             "SELECT u.id, u.display_name FROM users u JOIN contributions c ON c.user_id = u.id WHERE c.goal_id = ? "
             "UNION SELECT u.id, u.display_name FROM users u JOIN group_members m ON m.user_id = u.id WHERE m.group_id = ?",
             (goal_id, goal["group_id"]))}
-    return solana_vault.vault_info(goal_id, names)
+        escrow = escrow_state(conn, goal, user["id"])
+    return solana_vault.vault_info(goal_id, names, escrow)
+
+
+# ---------- Escrow release, live tracker, public proof ----------
+
+@router.post("/goals/{goal_id}/release")
+def release_vault(goal_id: int, user: dict = Depends(current_user)):
+    """Escrow release: once the goal is reached, its creator (or the group owner) pays the
+    whole pot out to themselves (e.g. to book the trip). Bank: one deposit into their
+    account. Solana: the vault sends every GSD to their wallet, and it's burned."""
+    with db.connect() as conn:
+        goal = _goal_for_member(conn, goal_id, user["id"])
+        if not _can_manage(conn, goal, user["id"]):
+            raise HTTPException(403, "Only the person who created this goal, or the group owner, can release the vault")
+        _not_released(goal)
+        escrow = escrow_state(conn, goal, user["id"])
+        if escrow["state"] != "releasable":
+            raise HTTPException(409, "The vault stays locked until the goal is reached")
+        pot = round(escrow["pot"] * 100)
+        group_name = conn.execute("SELECT name FROM groups WHERE id = ?", (goal["group_id"],)).fetchone()["name"]
+
+    account = _from_account(user)
+    try:
+        nessie_id = banking.deposit(account["id"], pot, f"Payout from “{goal['title']}” vault · {group_name}",
+                                    user_id=user["id"], source="goal_payout")
+    except nessie.NessieError as e:
+        raise HTTPException(502, f"The bank couldn't pay out the vault: {e}")
+
+    with db.connect() as conn:
+        done = conn.execute("UPDATE goals SET released_at = ?, released_cents = ?, released_to = ? "
+                            "WHERE id = ? AND released_at IS NULL", (db.now(), pot, user["id"], goal_id)).rowcount
+        if not done:   # someone else released it a split second earlier
+            raise HTTPException(409, "This vault was just released")
+        _log(conn, goal["group_id"], user["id"], "goal_released",
+             f"💸 {user['display_name']} released the “{goal['title']}” vault: ${dollars(pot):,.2f} paid out")
+    solana_vault.enqueue_release(goal_id, user["id"], pot,
+                                 f"Gatorstar | goal {goal_id} “{goal['title'][:40]}” | escrow released | "
+                                 f"${dollars(pot):,.2f} to {user['display_name'][:30]} | nessie {nessie_id}")
+    return {"released": dollars(pot), "to_account": account["nickname"], "nessie_id": nessie_id}
+
+
+@router.get("/contributions/{contribution_id}/chain")
+def contribution_chain(contribution_id: int, user: dict = Depends(current_user)):
+    """Live tracker for one contribution: bank withdrawal -> queued -> sent -> confirmed on Solana."""
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Contribution not found")
+        _goal_for_member(conn, row["goal_id"], user["id"])
+    step = solana_vault.chain_step(contribution_id) if solana_vault.ENABLED else None
+    return {"enabled": solana_vault.ENABLED, "contribution_id": contribution_id, "amount": dollars(row["amount_cents"]),
+            "bank": {"nessie_id": row["nessie_id"], "at": row["created_at"]}, "chain": step}
+
+
+@router.post("/goals/{goal_id}/share")
+def share_goal_proof(goal_id: int, user: dict = Depends(current_user)):
+    """Make (or reuse) a public link to this goal's proof page. Any member can share it."""
+    with db.connect() as conn:
+        goal = _goal_for_member(conn, goal_id, user["id"])
+        token = goal["public_token"]
+        if not token:
+            token = secrets.token_urlsafe(9)
+            conn.execute("UPDATE goals SET public_token = ? WHERE id = ?", (token, goal_id))
+    return {"token": token}
+
+
+def _first(name: str) -> str:
+    return (name or "Member").split(" ")[0]
+
+
+@router.get("/public/vault/{token}")
+def public_vault(token: str):
+    """The public proof page (no login): the goal, its escrow state and the vault on Solana.
+    Shows first names only; anyone can re-check everything against the blockchain."""
+    if not token or len(token) > 40:
+        raise HTTPException(404, "Proof page not found")
+    with db.connect() as conn:
+        goal = conn.execute("SELECT * FROM goals WHERE public_token = ?", (token,)).fetchone()
+        if goal is None:
+            raise HTTPException(404, "Proof page not found")
+        group_name = conn.execute("SELECT name FROM groups WHERE id = ?", (goal["group_id"],)).fetchone()["name"]
+        names = {r["id"]: _first(r["display_name"]) for r in conn.execute(
+            "SELECT u.id, u.display_name FROM users u JOIN contributions c ON c.user_id = u.id WHERE c.goal_id = ? "
+            "UNION SELECT u.id, u.display_name FROM users u JOIN group_members m ON m.user_id = u.id WHERE m.group_id = ?",
+            (goal["id"], goal["group_id"]))}
+        escrow = escrow_state(conn, goal, None)
+        escrow["released_to"] = _first(escrow["released_to"]) if escrow["released_to"] else None
+        members = len(names)
+    vault = solana_vault.vault_info(goal["id"], names, escrow)
+    return {
+        "goal": {"title": goal["title"], "group": group_name, "target": dollars(goal["target_cents"]),
+                 "deadline": goal["deadline"], "created_at": goal["created_at"], "completed_at": goal["completed_at"],
+                 "members": members},
+        "escrow": escrow,
+        "vault": vault,
+    }
+
+
+@router.get("/public/qr.svg")
+def qr_svg(data: str):
+    """A QR code (SVG) for a share link, so a phone can open the proof page."""
+    from fastapi.responses import Response
+    if not data or len(data) > 300 or not data.startswith(("http://", "https://")):
+        raise HTTPException(400, "Give a link to encode")
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        raise HTTPException(503, "QR codes need the 'qrcode' package: pip install -r requirements.txt")
+    img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage, box_size=10, border=2)
+    return Response(img.to_string(encoding="unicode"), media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.delete("/contributions/{contribution_id}")
@@ -710,11 +938,13 @@ def undo_contribution(contribution_id: int, user: dict = Depends(current_user)):
     """Undo one of your own contributions. The money goes back to your bank account."""
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT c.*, g.group_id, g.title FROM contributions c JOIN goals g ON g.id = c.goal_id WHERE c.id = ?",
+            "SELECT c.*, g.group_id, g.title, g.released_at FROM contributions c JOIN goals g ON g.id = c.goal_id WHERE c.id = ?",
             (contribution_id,),
         ).fetchone()
         if row is None or row["user_id"] != user["id"]:
             raise HTTPException(404, "Contribution not found")
+        if row["released_at"]:
+            raise HTTPException(409, "This goal's vault has already been paid out, so this can't be undone")
 
     how = "removed"
     if row["nessie_id"]:

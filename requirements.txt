@@ -6,3 +6,4 @@ python-dotenv==1.2.4
 google-genai
 pydantic
 solders==0.29.0
+qrcode==8.2

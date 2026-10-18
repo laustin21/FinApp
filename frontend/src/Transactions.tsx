@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, cached } from "./api";
+import { useLive } from "./live";
 
 /** The statement request for a period/account (App.tsx uses it to preload the default view). */
 export const statementPath = (period: string, accountId = "") =>
@@ -107,6 +108,9 @@ export default function Transactions({ embedded = false }: { embedded?: boolean 
     },
     [period, accountId],
   );
+
+  // New transactions (goal savings, simulations) show up within ~2 s.
+  useLive(["money"], () => load(true));
 
   useEffect(() => {
     load();

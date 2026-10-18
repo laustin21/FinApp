@@ -43,10 +43,12 @@ import os
 import struct
 import threading
 import time
+from datetime import datetime
 
 import requests
 
 import db
+import live
 
 ENABLED = os.getenv("SOLANA_ENABLED", "1") != "0"
 MISSING_LIBRARY = None
@@ -63,6 +65,8 @@ except ImportError:  # the app still runs; vaults are just off until it's instal
     ENABLED = False
     print(f"Solana vaults are off: {MISSING_LIBRARY}")
 RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.devnet.solana.com")
+# What browsers use to check the chain themselves (never a private RPC URL with a key in it).
+PUBLIC_RPC_URL = os.getenv("SOLANA_PUBLIC_RPC_URL", "https://api.devnet.solana.com")
 CLUSTER = "devnet" if "devnet" in RPC_URL else "testnet" if "testnet" in RPC_URL else "custom"
 EXPLORER = "https://explorer.solana.com"
 
@@ -95,7 +99,7 @@ def init_tables():
             pubkey TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL,
             PRIMARY KEY (owner_kind, owner_id)
         );
-        -- Queue of on-chain steps. kind: deposit | refund.
+        -- Queue of on-chain steps. kind: deposit | refund | release.
         -- status: pending -> sent -> confirmed (or failed / cancelled).
         CREATE TABLE IF NOT EXISTS chain_ops (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +112,11 @@ def init_tables():
         CREATE INDEX IF NOT EXISTS chain_ops_status ON chain_ops (status, id);
         CREATE INDEX IF NOT EXISTS chain_ops_goal ON chain_ops (goal_id);
         """)
+        # Added later: where and how fast each step landed on-chain (for the live tracker).
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(chain_ops)")}
+        for column, kind in (("slot", "INTEGER"), ("block_time", "INTEGER"), ("fee_lamports", "INTEGER"), ("confirmed_at", "REAL")):
+            if column not in have:
+                conn.execute(f"ALTER TABLE chain_ops ADD COLUMN {column} {kind}")
 
 
 init_tables()
@@ -373,6 +382,38 @@ def enqueue_refund(contribution_id: int, memo: str):
     _wake.set()
 
 
+def enqueue_release(goal_id: int, recipient_id: int, cents: int, memo: str):
+    """Escrow release: move the whole pot out of the vault to the recipient (and burn it,
+    because the dollars are paid out in their bank account). Uses the refund transaction shape."""
+    if not ENABLED or cents <= 0:
+        return
+    with db.connect() as conn:
+        conn.execute("INSERT INTO chain_ops (kind, goal_id, user_id, contribution_id, amount_cents, memo, created_at, updated_at) "
+                     "VALUES ('release', ?, ?, NULL, ?, ?, ?, ?)", (goal_id, recipient_id, cents, memo, _now(), _now()))
+    _wake.set()
+
+
+def chain_step(contribution_id: int) -> dict | None:
+    """The live tracker: where one contribution's on-chain step is right now."""
+    with db.connect() as conn:
+        op = conn.execute("SELECT * FROM chain_ops WHERE contribution_id = ? AND kind = 'deposit' ORDER BY id DESC LIMIT 1",
+                          (contribution_id,)).fetchone()
+    if op is None:
+        return None
+    try:
+        created = datetime.fromisoformat(op["created_at"]).timestamp()
+    except (TypeError, ValueError):
+        created = None
+    return {
+        "status": op["status"], "attempts": op["attempts"], "error": op["error"], "signature": op["signature"],
+        "url": explorer_tx(op["signature"]) if op["signature"] else None, "network": CLUSTER,
+        "slot": op["slot"], "block_time": op["block_time"],
+        "fee_sol": op["fee_lamports"] / LAMPORTS_PER_SOL if op["fee_lamports"] is not None else None,
+        "queued_at": created, "sent_at": op["sent_at"], "confirmed_at": op["confirmed_at"],
+        "amount": op["amount_cents"] / 100, "memo": op["memo"],
+    }
+
+
 def enqueue_goal_refunds(goal_id: int, title: str):
     """Goal deleted: give every on-chain deposit back."""
     with db.connect() as conn:
@@ -412,7 +453,16 @@ def _process_one(auth: Keypair, mint: Pubkey) -> bool:
         if s and s.get("err"):
             _update(op["id"], status="pending", error=f"Transaction failed: {s['err']}")
         elif s and s.get("confirmationStatus") in ("confirmed", "finalized"):
-            _update(op["id"], status="confirmed", error=None)
+            details = {"slot": s.get("slot")}
+            try:  # fee + block time, for the live tracker (nice to have, never blocks confirming)
+                tx = rpc("getTransaction", [op["signature"], {"encoding": "json", "commitment": "confirmed",
+                                                               "maxSupportedTransactionVersion": 0}])
+                if tx:
+                    details.update(fee_lamports=(tx.get("meta") or {}).get("fee"), block_time=tx.get("blockTime"))
+            except ChainError:
+                pass
+            _update(op["id"], status="confirmed", error=None, confirmed_at=time.time(), **details)
+            live.bump("groups")  # everyone viewing this goal sees "✓ on-chain" right away
         elif time.time() - (op["sent_at"] or 0) > CONFIRM_TIMEOUT:
             _update(op["id"], status="pending", error="Didn't confirm in time; sending again")
         else:
@@ -481,7 +531,10 @@ def start_worker():
             except Exception as e:  # never let the worker die
                 _state.update(state="offline", error=f"{e.__class__.__name__}: {e}"[:200])
                 print(f"Solana worker error: {e}")
-            _wake.wait(WORKER_INTERVAL)
+            # Check back quickly while a transaction is confirming, so the live tracker feels instant.
+            with db.connect() as conn:
+                in_flight = conn.execute("SELECT 1 FROM chain_ops WHERE status = 'sent' LIMIT 1").fetchone()
+            _wake.wait(0.6 if in_flight else WORKER_INTERVAL)
             _wake.clear()
 
     threading.Thread(target=loop, daemon=True, name="solana-worker").start()
@@ -519,8 +572,10 @@ def status() -> dict:
 _balance_cache: dict = {}
 
 
-def vault_info(goal_id: int, names: dict[int, str]) -> dict:
-    """Everything the goal's vault panel shows. `names` maps user_id -> display name."""
+def vault_info(goal_id: int, names: dict[int, str], escrow: dict | None = None) -> dict:
+    """Everything the goal's vault panel shows. `names` maps user_id -> display name.
+    `escrow` (from groups.py): {"state": locked|releasable|released, "released_cents", ...}."""
+    escrow = escrow or {"state": "locked", "released_cents": 0}
     if not ENABLED:
         return {"enabled": False}
     vault_addr = str(wallet("goal", goal_id).pubkey())
@@ -548,6 +603,8 @@ def vault_info(goal_id: int, names: dict[int, str]) -> dict:
 
     members: dict[int, dict] = {}
     for o in ops:
+        if o["kind"] == "release":
+            continue  # the payout isn't anyone's deposit
         m = members.setdefault(o["user_id"], {"user_id": o["user_id"], "name": names.get(o["user_id"], "Former member"),
                                               "wallet": wallet_address("user", o["user_id"]), "confirmed": 0, "waiting": 0})
         sign = 1 if o["kind"] == "deposit" else -1
@@ -566,8 +623,21 @@ def vault_info(goal_id: int, names: dict[int, str]) -> dict:
                 "kind": o["kind"], "status": o["status"],
                 "url": explorer_tx(o["signature"]) if o["signature"] and o["status"] in ("sent", "confirmed") else None}
 
+    # What the vault should hold: everything saved, minus a payout once it's released.
+    expected = app_total - (escrow.get("released_cents") or 0)
+    vault_token = str(token_account(Pubkey.from_string(vault_addr), Pubkey.from_string(mint))) if mint else None
+    audit = {
+        "rpc_url": PUBLIC_RPC_URL, "network": CLUSTER, "mint": mint, "vault_owner": vault_addr,
+        "vault_token_account": vault_token, "expected_balance": expected / 100,
+        "records": [{
+            "kind": o["kind"], "contribution_id": o["contribution_id"], "user": names.get(o["user_id"], "Former member"),
+            "wallet": wallet_address("user", o["user_id"]), "amount": o["amount_cents"] / 100, "signature": o["signature"],
+            "slot": o["slot"],
+        } for o in reversed(ops) if o["status"] == "confirmed" and o["signature"]],
+    }
     return {
         "enabled": True, "network": CLUSTER, "state": _state["state"], "error": _state["error"],
+        "escrow": escrow, "audit": audit,
         "vault_address": vault_addr, "vault_url": explorer_address(vault_addr),
         "token": {"symbol": "GSD", "mint": mint, "url": explorer_address(mint) if mint else None},
         "onchain_balance": onchain / 100 if onchain is not None else None,
@@ -576,7 +646,8 @@ def vault_info(goal_id: int, names: dict[int, str]) -> dict:
         "app_ledger_total": app_total / 100,
         "waiting": len(waiting),
         # Verified = the public chain holds exactly what the app's records say is in the pot.
-        "verified": onchain is not None and not waiting and onchain == confirmed == app_total,
+        "verified": onchain is not None and not waiting and onchain == confirmed == expected,
+        "expected_balance": expected / 100,
         "members": sorted(members.values(), key=lambda m: -m["confirmed"]),
         "transactions": [{
             "kind": o["kind"], "user": names.get(o["user_id"], "Former member"), "amount": o["amount_cents"] / 100,

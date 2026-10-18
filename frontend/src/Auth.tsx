@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, setToken } from "./api";
+import { Logo } from "./Logo";
 
 type DemoUser = { id: number; username: string; display_name: string };
 type Availability = { username: string; valid: boolean; available: boolean } | null;
@@ -110,11 +111,7 @@ export default function Auth({ onLoggedIn }: { onLoggedIn: () => void }) {
     <div className="grid min-h-screen place-items-center bg-[#FFFAED] px-5 py-10 text-[#275992]">
       <div className="w-full max-w-[420px]">
         <div className="mb-8 flex items-center justify-center gap-3">
-          <div className="grid size-10 place-items-center rounded-[12px] bg-[#95A1D8] text-white">
-            <svg aria-hidden="true" height="22" viewBox="0 0 24 24" width="22">
-              <path d="M4 18V9l8-5 8 5v9l-8-4.6L4 18Z" fill="currentColor" />
-            </svg>
-          </div>
+          <Logo size={52} />
           <span className="text-[22px] font-bold tracking-[-0.04em]">Gatorstar</span>
         </div>
 

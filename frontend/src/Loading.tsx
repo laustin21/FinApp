@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type Me } from "./api";
 import { statementPath } from "./Transactions";
+import { Logo } from "./Logo";
 
 // Full-screen loading screens. They cover Nessie's slow first load with something
 // that tells the story: signing in, connecting the bank, syncing transactions.
@@ -36,11 +37,9 @@ export function LoadingScreen({
     >
       <div className="w-full max-w-[420px] rounded-[24px] border border-[#DADDF1] bg-[#FFFDF7] p-7 shadow-[0_20px_60px_-30px_rgba(39,89,146,0.35)] sm:p-9">
         <div className="flex items-center gap-3">
-          <div className="relative grid size-11 place-items-center rounded-[14px] bg-[#95A1D8] text-white">
-            <span className="absolute inset-0 animate-ping rounded-[14px] bg-[#95A1D8] opacity-20" />
-            <svg aria-hidden="true" className="relative" height="23" viewBox="0 0 24 24" width="23">
-              <path d="M4 18V9l8-5 8 5v9l-8-4.6L4 18Z" fill="currentColor" />
-            </svg>
+          <div className="relative grid size-11 place-items-center">
+            <span className="absolute inset-0 animate-ping rounded-full bg-[#95A1D8] opacity-20" />
+            <Logo className="relative" size={44} />
           </div>
           <span className="text-[19px] font-bold tracking-[-0.04em]">Gatorstar</span>
         </div>
